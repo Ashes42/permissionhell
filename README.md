@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.3 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
+**v0.4 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
 access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
@@ -42,6 +42,7 @@ standard library. Unsupported operating systems report a clear error, while
 ```bash
 python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py audit TARGET_PATH [--mode {r,w,x}] [--verbose]
+python3 permissionhell.py audit TARGET_PATH --explain USERNAME [--mode {r,w,x}] [--verbose]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -72,12 +73,98 @@ check alone does not establish that a whole operation will succeed.
 Relative paths start at the debugger's current working directory. Shell expansion
 of `~` happens before invocation; the program does not expand a quoted `~`.
 
-The account being evaluated is always `--as`, regardless of who launches the
+The account being evaluated is supplied by `--as` or `--explain`, regardless of who launches the
 debugger. The program does not impersonate the account or call `os.access()`.
 An unprivileged debugger may be unable to read necessary metadata. That produces
 a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
+
+## Focused audit explanations (v0.4)
+
+```bash
+permissionhell audit /srv/secrets/report.csv --explain www-data
+permissionhell audit /srv/secrets/report.csv --mode w --explain www-data
+permissionhell audit /srv/secrets/report.csv --explain www-data --verbose
+```
+
+`diagnose --as USER` gives a single-account diagnostic. Normal `audit` summarizes
+all local accounts. `audit --explain USER` shows just that identity's ordered
+access path with selected mechanisms and the first blocker. Adding `--verbose`
+appends the complete underlying diagnostic, including inspected ACL entries,
+group memberships, mount options, and scope. No all-account audit runs first.
+
+The dedicated `AuditExplanation` retains the existing engine's `Diagnosis`.
+Rendering consumes those decisions; it does not evaluate permissions again.
+Explicit `--explain` names use the same system identity lookup as `diagnose`
+(which may consult NSS), rather than enumerating `/etc/passwd`. Unlike the
+all-account audit's global existence preflight, resolution follows the chosen
+subject's traversal and stops at its first blocker. An unreachable later missing
+component therefore does not replace a known earlier traversal denial.
+
+Illustrative permitted result (ordinary metadata shortened here):
+
+```text
+PERMISSION HELL v0.4 | AUDIT EXPLAIN
+Target: '/data/file'
+Subject: member (UID 2000)
+Requested: READ
+
+RESULT: PERMITTED
+
+ACCESS PATH
+  '/'  PASS search | OTHER r-x
+  '/data'  PASS search | GROUP r-x
+    via supplementary group media (GID 500)
+  '/data/file'  PASS READ | GROUP r--
+    via supplementary group media (GID 500)
+    Owner: owner (UID 9000) | Group: media (GID 500) | Mode: 0644 (-rw-r--r--)
+  Mount: '/' | ext4 | READ-WRITE | PASS
+
+WHY
+  Every parent permits search.
+  Access via GROUP (supplementary group media, GID 500); effective: r--.
+  Requested access survives the mount checks.
+```
+
+Illustrative denial excerpt:
+
+```text
+PERMISSION HELL v0.4 | AUDIT EXPLAIN
+Target: '/data/file'
+Subject: visitor (UID 2001)
+Requested: READ
+
+RESULT: DENIED
+
+ACCESS PATH
+  '/'  PASS search | OTHER r-x
+  '/data'  FAIL search | OTHER --- <-- BLOCKED HERE
+    OTHER applies: subject is neither owner nor in the owning group. Missing EXECUTE/SEARCH.
+  Target not evaluated because path resolution/traversal stopped.
+  Mount: not evaluated; target unresolved.
+
+WHY
+  Traversal blocked at '/data': subject lacks execute/search permission.
+```
+
+Relevant ACL steps show matching entries, group union, mask, effective bits and
+requested permission/result; unrelated ACL entries stay hidden by default.
+Root overrides are marked only where they change the decision. Symlinks appear
+as `link -> destination`, followed by the final resolved target when available.
+Repeated identical successful searches retain their sequence position with a
+short reference to the previous check. Mount denials mark the mount as the first
+blocker if the inode checks passed.
+
+Focused exit codes are **0 permitted, 1 denied, 2 invalid input/path/user,
+3 diagnostic/system error**. Normal audit still returns **0** when evaluation
+completes, even if some or all accounts are denied; it returns 2 for invalid
+input/path and 3 for incomplete inspection. A known denial remains definitive
+even when mount inspection is unavailable, with that limitation shown.
+
+The package and `--version` report **0.4.0**. Existing diagnose and normal-audit
+renderers retain their v0.3 banners/output for compatibility; the focused report
+uses a v0.4 banner. The permission model is unchanged.
 
 ## Local-account access audits
 
@@ -406,11 +493,11 @@ flags are not modeled.
 ## Exit codes
 
 Definitions are centralized in `ExitCode` in `permissionhell.py`. The following
-table describes **diagnose**, unchanged from v0.2; audit semantics are above.
+table describes **diagnose and audit --explain**; normal audit semantics are above.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Requested access permitted by the v0.3 model |
+| 0 | Requested access permitted by the DAC + ACL + mount model |
 | 1 | Requested access denied by a modeled check |
 | 2 | Invalid CLI/input: malformed arguments, unknown user, missing component, broken/looping link, non-directory component |
 | 3 | Diagnostic/system error: inaccessible metadata, required ACL inspection failed, unavailable mount information without an established denial, unsupported platform |

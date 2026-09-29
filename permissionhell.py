@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Permission Hell v0.3: read-only Linux access diagnosis and local-account audits."""
+"""Permission Hell v0.4: read-only Linux access diagnosis and local-account audits."""
 
 from __future__ import annotations
 
@@ -481,6 +481,28 @@ def audit_target(path: str, mode: str = "r") -> AuditReport:
     return report
 
 
+@dataclass
+class AuditExplanation:
+    """Focused audit result; retain the complete engine diagnosis for expansion."""
+
+    diagnosis: Diagnosis
+
+    @property
+    def code(self) -> ExitCode:
+        return self.diagnosis.code
+
+
+def explain_audit_target(path: str, username: str, mode: str = "r") -> AuditExplanation:
+    """Evaluate only the explicitly named identity, using the diagnosis engine.
+
+    Unlike inventory audit, no /etc/passwd enumeration or global path preflight
+    is needed: the subject's own ordered traversal provides the focused result.
+    Explicit names use the same system identity lookup as diagnose, including NSS.
+    This separate result keeps audit framing extensible without another evaluator.
+    """
+    return AuditExplanation(diagnose(path, resolve_subject(username), mode))
+
+
 def bits(value: int) -> str:
     return "".join(letter if value & bit else "-" for bit, letter in ((4, "r"), (2, "w"), (1, "x")))
 
@@ -881,9 +903,99 @@ def render_audit(report: AuditReport, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
+def explanation_inode_lines(inode: Inode, subject: Subject, operation: str,
+                            first_blocker: bool) -> list[str]:
+    decision = inode.decision
+    marker = " <-- BLOCKED HERE" if first_blocker else ""
+    lines = [f"  {inode.path!r}  {'PASS' if decision.allowed else 'FAIL'} {operation}"
+             f" | {access_summary(inode, subject)}{marker}"]
+    if acl_relevant(inode):
+        lines.append("    " + acl_explanation(inode))
+    # Use captured identity data only; rendering must not query NSS or the disk.
+    matched_gids = set()
+    if inode.acl_match and inode.acl_match.selection == "GROUP":
+        matched_gids = {inode.gid if entry.tag == Tag.GROUP_OBJ else entry.qualifier
+                        for entry in inode.acl_match.entries}
+    elif decision.permission_class == "GROUP" and subject.uid != 0:
+        matched_gids = {inode.gid}
+    names = dict(zip(subject.supplementary_gids, subject.supplementary_groups))
+    for gid in sorted(matched_gids):
+        if gid == subject.primary_gid:
+            lines.append(f"    via primary group {subject.primary_group} (GID {gid})")
+        elif gid in names:
+            lines.append(f"    via supplementary group {names[gid]} (GID {gid})")
+    # Relevant ACL detail above already includes the denial explanation.
+    if not decision.allowed and not acl_relevant(inode):
+        lines.append("    " + denial_explanation(inode, subject))
+    return lines
+
+
+def render_audit_explanation(explanation: AuditExplanation, verbose: bool = False) -> str:
+    """Project existing decisions into an ordered access path, without evaluating access."""
+    report = explanation.diagnosis
+    subject, trace = report.subject, report.trace
+    result = {ExitCode.ALLOWED: "PERMITTED", ExitCode.DENIED: "DENIED",
+              ExitCode.INPUT: "UNRESOLVED PATH / INVALID INPUT", ExitCode.ERROR: "INCOMPLETE"}[report.code]
+    lines = ["PERMISSION HELL v0.4 | AUDIT EXPLAIN", f"Target: {report.requested_path!r}",
+             f"Subject: {subject.username} (UID {subject.uid})",
+             f"Requested: {OPERATIONS[report.mode][1]}", "", f"RESULT: {result}", "", "ACCESS PATH"]
+    if subject.uid == 0:
+        lines.append("  ROOT: assumes traditional privileged UID 0; overrides marked where applied.")
+    seen = set()
+    blocked = False
+    for event in trace.events:
+        if isinstance(event, Symlink):
+            lines.append(f"  LINK {event.path!r} -> {event.destination!r}")
+        else:
+            if event in seen and event.decision.allowed:
+                # Keep the position visible without repeating ACL/group detail.
+                lines.append(f"  {event.path!r}  PASS search | {access_summary(event, subject)} (same check as above)")
+                continue
+            seen.add(event)
+            lines.extend(explanation_inode_lines(event, subject, "search", not event.decision.allowed and not blocked))
+            blocked |= not event.decision.allowed
+    if any(isinstance(event, Symlink) for event in trace.events) and trace.resolved_path:
+        lines.append(f"  Resolved target: {trace.resolved_path!r}")
+    target = trace.target
+    if target:
+        lines.extend(explanation_inode_lines(target, subject, OPERATIONS[report.mode][1],
+                                             not target.decision.allowed and not blocked))
+        blocked |= not target.decision.allowed
+        lines.append(f"    Owner: {target.owner} (UID {target.uid}) | Group: {target.group} (GID {target.gid})"
+                     f" | Mode: {stat.S_IMODE(target.mode):04o} ({stat.filemode(target.mode)})")
+    else:
+        lines.append("  Target not evaluated because path resolution/traversal stopped.")
+    if trace.failure and not blocked:
+        lines.append(f"  {'FAIL' if report.code == ExitCode.DENIED else 'ERROR'}: {trace.failure} <-- STOPPED HERE")
+    # The verdict engine places mount denials after the two target-denial reasons.
+    # Consume those decisions, rather than reimplementing ro/noexec semantics here.
+    mount_reasons = (report.reasons[2:] if target and not target.decision.allowed else report.reasons)
+    mount_reasons = mount_reasons if not trace.failure and report.code == ExitCode.DENIED else []
+    if report.mount:
+        mount = report.mount
+        status = "FAIL" if mount_reasons else "PASS"
+        marker = " <-- BLOCKED HERE" if mount_reasons and not blocked else ""
+        lines.append(f"  Mount: {mount.point!r} | {mount.filesystem} | "
+                     f"{'READ-ONLY' if mount.readonly else 'READ-WRITE'} | {status}{marker}")
+        lines.extend("    " + reason for reason in mount_reasons)
+    elif not report.mount_error:
+        lines.append("  Mount: not evaluated; target unresolved.")
+    if report.mount_error:
+        lines.append("  Mount: UNKNOWN | " + report.mount_error)
+    lines.extend(["", "WHY"])
+    if report.code == ExitCode.ALLOWED:
+        lines.extend(["  Every parent permits search.", "  " + audit_access_reason(target, subject),
+                      "  Requested access survives the mount checks."])
+    else:
+        lines.extend("  " + reason for reason in concise_reasons(report))
+    if verbose:
+        lines.extend(["", "FULL DIAGNOSTIC DETAIL", render_verbose_report(report)])
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
-    parser.add_argument("--version", action="version", version="permissionhell 0.3.0")
+    parser.add_argument("--version", action="version", version="permissionhell 0.4.0")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("diagnose", help="Explain Linux DAC, ACL, and mount access decisions", epilog=SCOPE_TEXT)
     command.add_argument("target_path")
@@ -895,13 +1007,19 @@ def main(argv: list[str] | None = None) -> int:
                                 epilog="Includes service accounts; reports modeled access, not intended policy. " + SCOPE_TEXT)
     audit.add_argument("target_path")
     audit.add_argument("--mode", choices=OPERATIONS, default="r")
-    audit.add_argument("--verbose", action="store_true", help="Show every account individually without grouping")
+    audit.add_argument("--explain", metavar="USER", help="Explain one named account's ordered access path")
+    audit.add_argument("--verbose", action="store_true",
+                       help="Show every account without grouping; with --explain, add full diagnostic detail")
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux"):
         print("permissionhell: unsupported platform; diagnosis requires Linux.", file=sys.stderr)
         return ExitCode.ERROR
     try:
         if args.command == "audit":
+            if args.explain is not None:
+                explanation = explain_audit_target(args.target_path, args.explain, args.mode)
+                print(render_audit_explanation(explanation, verbose=args.verbose))
+                return explanation.code
             audit_report = audit_target(args.target_path, args.mode)
             print(render_audit(audit_report, verbose=args.verbose))
             return audit_report.code
