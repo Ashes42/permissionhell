@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "permissionhell"
-version = "0.1.0"
-description = "A read-only Linux effective-access debugger for Unix DAC and mount restrictions"
+version = "0.2.0"
+description = "A read-only Linux effective-access debugger for Unix DAC, POSIX ACLs, and mount restrictions"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
@@ -14,4 +14,4 @@ dependencies = []
 permissionhell = "permissionhell:main"
 
 [tool.setuptools]
-py-modules = ["permissionhell"]
+py-modules = ["permissionhell", "posix_acl"]

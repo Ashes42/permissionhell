@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Permission Hell v0.1: read-only Linux DAC and mount diagnostics."""
+"""Permission Hell v0.2: read-only Linux DAC, POSIX ACL, and mount diagnostics."""
 
 from __future__ import annotations
 
@@ -11,6 +11,9 @@ import os
 import re
 import stat
 import sys
+
+from posix_acl import (AccessACL, ACLEntry, ACLMatch, ACLInspectionError, Tag,
+                       evaluate_acl, read_access_acl, validate_acl_mode)
 
 try:
     import grp
@@ -122,12 +125,39 @@ class Inode:
     group: str
     mode: int
     decision: PermissionDecision
+    acl: AccessACL | None = None
+    acl_match: ACLMatch | None = None
+    acl_note: str | None = None
+    dac_decision: PermissionDecision | None = None
 
 
 def inspect_inode(path: str, metadata: os.stat_result, subject: Subject, mode: str) -> Inode:
+    dac = evaluate_permission(subject, metadata, mode)
+    decision = dac
+    acl = match = None
+    # These decisions are independent of access ACLs. Owner bits mirror user::,
+    # which is unmasked; our documented privileged-root model bypasses ACL DAC.
+    # Avoid an unnecessary xattr dependency when the answer is already known.
+    if subject.uid == 0:
+        note = "ACL inspection not needed: traditional privileged root bypasses ACL DAC; execute-bit checks still apply."
+    elif subject.uid == metadata.st_uid:
+        note = "ACL inspection not needed: OWNER mode bits equal unmasked user:: permissions; no named entry can override them."
+    else:
+        try:
+            acl = read_access_acl(path)
+            if acl is not None:
+                validate_acl_mode(acl, metadata.st_mode)
+                match = evaluate_acl(acl, subject.uid, subject.gids, metadata.st_uid, metadata.st_gid, dac.required)
+        except ACLInspectionError as exc:
+            raise DiagnosticError(f"ACL inspection failed at {path!r}: {exc} Effective access is unknown.") from exc
+        note = "No access ACL (ENODATA)." if acl is None else None
+        if acl is not None and acl.extended:
+            selected = "ACL USER" if match.selection == "NAMED USER" else match.selection
+            decision = PermissionDecision(selected, match.effective, dac.required, match.allowed,
+                f"POSIX access ACL {'permits' if match.allowed else 'denies'} {OPERATIONS[mode][1]}"
+                f" via {match.selection.lower()} selection; no fallback after a match.")
     return Inode(path, metadata.st_uid, metadata.st_gid, owner_name(metadata.st_uid),
-                 group_name(metadata.st_gid), metadata.st_mode,
-                 evaluate_permission(subject, metadata, mode))
+                 group_name(metadata.st_gid), metadata.st_mode, decision, acl, match, note, dac)
 
 
 @dataclass(frozen=True)
@@ -317,7 +347,8 @@ def bits(value: int) -> str:
 
 SCOPE_TEXT = (
     "Scope: account database groups; debugger's mount namespace; traditional privileged root.\n"
-    "Not modeled: POSIX ACLs, SELinux, AppArmor, process capabilities, user namespaces,\n"
+    "Modeled: Unix DAC, POSIX ACLs (access ACLs), and mount restrictions.\n"
+    "Not modeled: SELinux, AppArmor, process capabilities, user namespaces,\n"
     "container UID/GID mappings, NFS/SMB/FUSE rules, inode flags, or other process restrictions.\n"
     "This is a read-only model, not a guarantee that an actual syscall will succeed."
 )
@@ -338,13 +369,75 @@ def access_summary(inode: Inode, subject: Subject) -> str:
     if subject.uid == 0:
         label = "ROOT OVERRIDE" if decision.root_override else "ROOT"
         return f"{label} [ordinary {ordinary}]"
+    if acl_relevant(inode):
+        return f"ACL {inode.acl_match.selection} {bits(inode.acl_match.effective)}"
     return ordinary
+
+
+def acl_relevant(inode: Inode) -> bool:
+    """Whether ACL detail helps explain this particular subject's access."""
+    match = inode.acl_match
+    return bool(inode.acl and inode.acl.extended and match and (
+        match.selection == "NAMED USER"
+        or any(entry.tag == Tag.GROUP for entry in match.entries)
+        or match.specified != match.effective
+        or (inode.dac_decision and match.effective != inode.dac_decision.available)))
+
+
+def acl_entry_text(entry: ACLEntry) -> str:
+    tag = {Tag.OWNER: "user", Tag.USER: "user", Tag.GROUP_OBJ: "group",
+           Tag.GROUP: "group", Tag.MASK: "mask", Tag.OTHER: "other"}[entry.tag]
+    qualifier = "" if entry.qualifier is None else str(entry.qualifier)
+    return f"{tag}:{qualifier}:{bits(entry.permissions)}"
+
+
+def acl_explanation(inode: Inode) -> str:
+    match = inode.acl_match
+    entries = ", ".join(acl_entry_text(entry) for entry in match.entries)
+    prefix = f"ACL {match.selection}: {entries}."
+    if match.selection == "GROUP":
+        prefix += f" Group union: {bits(match.specified)}."
+    if match.mask is not None:
+        prefix += f" Mask: {bits(match.mask)}; effective: {bits(match.effective)}."
+        if match.specified & match.required and not match.effective & match.required:
+            operation = {4: "READ", 2: "WRITE", 1: "EXECUTE/SEARCH"}[match.required]
+            return prefix + f" The ACL mask removes {operation}; access denied, no fallback."
+    else:
+        prefix += f" Effective: {bits(match.effective)} (unmasked)."
+    operation = {4: "READ", 2: "WRITE", 1: "EXECUTE/SEARCH"}[match.required]
+    if match.allowed:
+        return prefix + f" {operation} permitted."
+    return prefix + f" Selected ACL permissions lack {operation}; access denied, no fallback."
+
+
+def render_acl(inode: Inode, verbose: bool = False) -> list[str]:
+    if verbose:
+        if inode.acl_note:
+            return [f"  ACL: {inode.acl_note}"]
+        if inode.acl is not None:
+            lines = ["  ACL (access):"]
+            for entry in inode.acl.entries:
+                marker = " [matched]" if entry in inode.acl_match.entries else ""
+                lines.append(f"    {acl_entry_text(entry)}{marker}")
+            lines.append(f"    {acl_explanation(inode)}")
+            if inode.acl.extended:
+                lines.append("    Mode group bits represent mask::, not group:: permissions.")
+                if inode.dac_decision:
+                    dac = inode.dac_decision
+                    lines.append(f"    Mode-only comparison: {dac.permission_class} {bits(dac.available)}"
+                                 f" -> {'PERMITTED' if dac.allowed else 'DENIED'}; ACL result governs.")
+            return lines
+    if acl_relevant(inode):
+        return [f"  {acl_explanation(inode)}"]
+    return []
 
 
 def denial_explanation(inode: Inode, subject: Subject) -> str:
     decision = inode.decision
     if subject.uid == 0:
         return "Root still needs at least one execute bit on a non-directory inode; none is set."
+    if acl_relevant(inode):
+        return acl_explanation(inode)
     selected = decision.permission_class
     why = {"OWNER": f"UID {subject.uid} owns this inode",
            "GROUP": f"subject belongs to owning GID {inode.gid}",
@@ -378,8 +471,8 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
     path = repr(report.requested_path)
     if report.trace.resolved_path is not None and report.trace.resolved_path != report.requested_path:
         path += f" -> {report.trace.resolved_path!r}"
-    lines = [f"PERMISSION HELL v0.1 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
-             f"Target: {path}", "", f"{verdict_label(report)} (DAC + mount model)",
+    lines = [f"PERMISSION HELL v0.2 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
+             f"Target: {path}", "", f"{verdict_label(report)} (DAC + ACL + mount model)",
              *concise_reasons(report)]
     if subject.uid == 0:
         lines.append("Root: assumes privileged UID 0; DAC bypasses are marked ROOT OVERRIDE.")
@@ -399,6 +492,8 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
         status = "PASS" if event.decision.allowed else "FAIL"
         marker = "" if event.decision.allowed else "  <-- BLOCKED HERE"
         lines.append(f"  {status} {event.path!r}  {access_summary(event, subject)}{marker}")
+        if event.decision.allowed:  # Failure reasoning is already prominent above.
+            lines.extend(render_acl(event))
     if repeated:
         lines.append(f"  ({repeated} repeated successful search checks omitted; --verbose shows all)")
     if not report.trace.events:
@@ -411,8 +506,12 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
                       f"  Owner: {target.owner} ({target.uid}) | Group: {target.group} ({target.gid})"
                       f" | Mode: {stat.S_IMODE(target.mode):04o} ({stat.filemode(target.mode)})",
                       f"  Access: {access_summary(target, subject)} | Required: {OPERATIONS[report.mode][1]} ({report.mode})"])
+        if target.decision.allowed:
+            lines.extend(render_acl(target))
     else:
-        lines.append("Target and mount not evaluated: path traversal did not complete.")
+        lines.append("Target and mount not evaluated: path traversal did not complete."
+                     if report.trace.resolved_path is None else
+                     "Target access not evaluated: inspection did not complete.")
     if report.mount:
         mount = report.mount
         options = "READ-ONLY" if mount.readonly else "READ-WRITE"
@@ -426,7 +525,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
 
 def render_verbose_report(report: Diagnosis) -> str:
     subject = report.subject
-    lines = ["PERMISSION HELL v0.1", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
+    lines = ["PERMISSION HELL v0.2", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
              "SUBJECT", f"User: {subject.username} (UID {subject.uid})",
              f"Primary group: {subject.primary_group} (GID {subject.primary_gid})",
              "Supplementary groups: " + (", ".join(f"{name} ({gid})" for name, gid in
@@ -441,6 +540,7 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"  requires x"
                       f"  UID={event.uid} GID={event.gid} mode={stat.S_IMODE(event.mode):04o}",
                       f"     {decision.reason}"])
+        lines.extend(render_acl(event, verbose=True))
     if not report.trace.events:
         lines.append("No parent components to traverse (or resolution could not start).")
     lines.extend(["", "TARGET INODE"])
@@ -454,6 +554,7 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"Available: {bits(target.decision.available)}",
                       f"DAC: {'PERMITTED' if target.decision.allowed else 'DENIED'}",
                       target.decision.reason])
+        lines.extend(render_acl(target, verbose=True))
     else:
         lines.append("Not evaluated: path resolution/traversal did not complete.")
     lines.extend(["", "MOUNT"])
@@ -465,15 +566,15 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"Status: {'READ-ONLY' if mount.readonly else 'READ-WRITE'}"])
     else:
         lines.append(report.mount_error or "Not evaluated: target path was not resolved.")
-    lines.extend(["", verdict_label(report) + " (v0.1 DAC + mount model)", *report.reasons, "", SCOPE_TEXT])
+    lines.extend(["", verdict_label(report) + " (v0.2 DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
-    parser.add_argument("--version", action="version", version="permissionhell 0.1.0")
+    parser.add_argument("--version", action="version", version="permissionhell 0.2.0")
     commands = parser.add_subparsers(dest="command", required=True)
-    command = commands.add_parser("diagnose", help="Explain Linux DAC and mount access decisions", epilog=SCOPE_TEXT)
+    command = commands.add_parser("diagnose", help="Explain Linux DAC, ACL, and mount access decisions", epilog=SCOPE_TEXT)
     command.add_argument("target_path")
     command.add_argument("--as", dest="username", required=True, help="Account to evaluate")
     command.add_argument("--mode", choices=OPERATIONS, default="r")
