@@ -21,14 +21,14 @@ class VersionDisplayTests(unittest.TestCase):
                 ph.render_report(diagnosis), ph.render_verbose_report(diagnosis)]
 
     def test_explain_current_release(self):
-        self.assertEqual(self.headings()[0].splitlines()[0], "PERMISSION HELL v1.4 | AUDIT EXPLAIN")
+        self.assertEqual(self.headings()[0].splitlines()[0], "PERMISSION HELL v1.5 | AUDIT EXPLAIN")
 
     def test_normal_audit_current_release(self):
-        self.assertEqual(self.headings()[1].splitlines()[0], "PERMISSION HELL v1.4 | ACCESS AUDIT")
+        self.assertEqual(self.headings()[1].splitlines()[0], "PERMISSION HELL v1.5 | ACCESS AUDIT")
 
     def test_diagnose_current_release(self):
-        self.assertTrue(self.headings()[2].startswith("PERMISSION HELL v1.4 | READ"))
-        self.assertEqual(self.headings()[3].splitlines()[0], "PERMISSION HELL v1.4")
+        self.assertTrue(self.headings()[2].startswith("PERMISSION HELL v1.5 | READ"))
+        self.assertEqual(self.headings()[3].splitlines()[0], "PERMISSION HELL v1.5")
 
     def test_cli_and_renderers_follow_canonical_version(self):
         for version, label in (("0.5.0", "v0.5"), ("1.2.0", "v1.2"), ("1.2.3", "v1.2.3")):

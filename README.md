@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v1.4 adds Linux Security Module awareness and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.5 adds one-shot access monitoring and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
 process contexts, not every Linux access-control layer.** SELinux and AppArmor
 state and context are inspected, but their full policies, other capability effects, foreign mount/root path translation,
@@ -13,6 +13,154 @@ container orchestration, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
 guarantee that a real process can perform it. Reports identify the DAC + ACL + mount
 model; `--verbose` and `--help` include the full scope and limitations.
+
+## One-shot access monitoring (v1.5)
+
+Create a baseline once, then check for meaningful changes without manually saving
+and naming a second snapshot. A baseline is an ordinary **snapshot version 1**
+file: existing snapshots work directly, with no separate baseline schema.
+
+```bash
+# Account baseline: defaults to READ and local account scope.
+python3 permissionhell.py monitor-init /srv/payroll.db --baseline payroll.json
+
+# Later: mode and scope are inherited from the validated baseline.
+python3 permissionhell.py monitor-check /srv/payroll.db --baseline payroll.json
+
+# Report changes and explicitly accept the complete current state.
+python3 permissionhell.py monitor-check /srv/payroll.db --baseline payroll.json --update-baseline
+```
+
+Initialization reports target, mode, scope, subject count and baseline path. An
+existing file is refused unless `--force` is supplied. An incomplete initial
+capture returns 3 and **does not write or replace a baseline**. If partial evidence
+is wanted, use the existing `snapshot` command instead.
+
+Checks load and validate the baseline before capturing current state. An explicitly
+supplied `--mode`, `--accounts` or `--processes` must match it. The literal absolute
+target path must also match; paths, scopes and modes are never silently reinterpreted.
+A missing/malformed/unsupported baseline returns 2. A valid baseline whose current
+target can no longer be inspected returns 3, preserving the baseline.
+
+Default output emphasizes gained access, lost access, newly indeterminate results,
+mechanism/context changes, target metadata and finally subject additions/removals.
+Unchanged subjects are omitted. For example (abbreviated):
+
+```text
+PERMISSION HELL v1.5 | ACCESS MONITOR
+Target: '/srv/payroll.db'
+Mode: r | Scope: accounts
+
+GAINED_ACCESS
+  'www-data' (UID 33)
+    before: DENIED via OTHER
+    after: PERMITTED via ACL named_user
+
+LOST_ACCESS
+  'backup' (UID 34)
+    before: PERMITTED via GROUP
+    after: DENIED via GROUP
+
+Baseline: 2026-09-29T18:00:00Z ('payroll.json')
+Current:  2026-09-30T18:00:00Z
+CHANGES DETECTED
+SUMMARY
+  1 gained_access; 1 lost_access
+Baseline unchanged.
+```
+
+A quiet comparison says **“No meaningful access changes since baseline.”**
+Mode, ownership, ACL, mount and inode/device changes still count even if every
+subject's access remains unchanged. Inode/device replacement gets a prominent
+`TARGET_CHANGED` warning. `--verbose` includes unchanged entries, full reasoning
+and captured process metadata. No command-line arguments are newly collected.
+
+| Command | Exit code | Meaning |
+| --- | --- | --- |
+| monitor-init | 0 | Complete baseline created |
+| monitor-init | 2 | Invalid input/output path or overwrite refused |
+| monitor-init | 3 | Incomplete capture or diagnostic/write error; baseline not accepted |
+| monitor-check | 0 | Complete comparison, no meaningful change |
+| monitor-check | 1 | Complete comparison, meaningful changes detected |
+| monitor-check | 2 | Invalid baseline or incompatible input |
+| monitor-check | 3 | Incomplete capture/comparison or diagnostic/update error |
+
+**Exit 1 is a change signal, not a runtime failure.** An explicit successful update
+does not erase that signal: the check still returns 1 if changes were found.
+The next check against that baseline can return 0. Uncertainty in either snapshot
+takes precedence and returns 3, even when useful changes can also be reported.
+
+`--update-baseline` is allowed only after a complete comparison (0 or 1). Human
+output is flushed before replacement, followed by confirmation. For JSON, the full
+comparison is rendered before replacement and one final document is emitted
+afterward so `baseline_updated` accurately reports success. A failed update keeps
+the comparison in the report, adds an error, leaves `baseline_updated` false and
+returns 3. Incomplete or invalid comparisons never update the baseline.
+
+Process monitoring uses the same snapshot identity rules and LSM/namespace analysis:
+
+```bash
+python3 permissionhell.py monitor-init /srv/payroll.db --processes --baseline processes.json
+python3 permissionhell.py monitor-check /srv/payroll.db --baseline processes.json --ignore-process-churn
+```
+
+PID plus start time is compared within a known host/boot/PID-namespace context.
+PID reuse remains a `SUBJECT_REMOVED` plus `SUBJECT_ADDED`, never a fabricated access
+gain/loss. A process starting or exiting is subject churn rather than proof that
+the same process changed access. Churn counts as a change for exit-code purposes.
+`--ignore-process-churn` hides those entries only in default human output; counts,
+warnings, JSON and exit codes remain complete. `--verbose` shows them again.
+Transient inspection failures and unresolved namespaces/LSM policies still make
+the comparison incomplete. AppArmor profile and SELinux context/enforcement changes
+are inherited directly from snapshot diff. A process baseline may be impossible
+to accept while some visible processes remain indeterminate; no uncertainty is
+silently filtered away to create a baseline.
+
+```bash
+python3 permissionhell.py monitor-check /srv/payroll.db --baseline payroll.json --json
+```
+
+JSON schema 1 includes `command: "monitor-check"`, tool version, baseline path and
+capture time, current capture time, target/mode/scope in both headers, all individual
+`changes` (including unchanged observations), `target_changes`, complete `summary`,
+warnings/errors, `exit_code` and `baseline_updated`. Error envelopes identify the
+baseline path and set `baseline_updated: false`; no timestamps or comparisons are
+invented when capture/load fails. `monitor-init --json` includes `baseline_created`
+and the captured snapshot.
+
+**File safety:** baseline publication reuses snapshot staging, file fsync and atomic
+replacement. Existing symlink/directory outputs are refused; direct target aliases,
+including hard links, are rejected. Staging uses a private file in the destination
+directory. Failed writes do not partially replace a baseline. Use a directory you
+control. As with snapshots, directory fsync and hard-crash durability are not
+guaranteed; interruption can leave a private staging file.
+
+There is no distributed or persistent lock. Concurrent readers see a complete old
+or new file. Concurrent explicit updates use last successful replacement wins;
+serialize updating invocations in your scheduler if update ordering matters.
+Ordinary checks only read the baseline and never overwrite it.
+
+**Scheduling:** these commands run once and exit. They are suitable for cron,
+systemd timers, CI or another orchestrator, for example:
+
+```bash
+permissionhell monitor-check /srv/payroll.db --baseline /var/lib/permissionhell/payroll.json --json
+```
+
+Permission Hell installs **no schedules, cron jobs, systemd units, timers or
+background services**, and has no watch loop. Configure schedules yourself and
+handle codes 1 and 3 explicitly in automation.
+
+**Privacy and safety:** baselines contain account identities and may contain process
+credentials, namespaces, profiles and security labels. Protect them as diagnostic
+artifacts. Monitoring does not modify permissions, ACLs, processes, mappings,
+namespaces, capabilities, mounts, LSM policy or analyzed target files. The only
+new writes are explicitly requested baseline files and their temporary staging;
+existing snapshot-output and Python bytecode-cache behavior are unchanged.
+
+Deferred: baseline archives/history databases, policy-result monitoring, process
+identity beyond existing snapshot rules, notifications, locking beyond atomic
+publication, automatic scheduling and daemon/watch modes.
 
 ## Linux Security Module awareness (v1.4)
 
@@ -242,7 +390,7 @@ only the two input snapshot files, never re-inspects their targets or subjects.
 Normal file-output acknowledgement is compact:
 
 ```text
-PERMISSION HELL v1.4 | SNAPSHOT
+PERMISSION HELL v1.5 | SNAPSHOT
 Target: '/srv/payroll.db'
 Mode: r | Scope: accounts
 Subjects captured: 28
@@ -579,7 +727,7 @@ was allowed; v1.2 reports the observed mechanism but does not invent mechanism d
 Illustrative shortened output:
 
 ```text
-PERMISSION HELL v1.4 | POLICY CHECK
+PERMISSION HELL v1.5 | POLICY CHECK
 Policy: 'policy.json'
 
 '/srv/payroll.db' | READ
@@ -889,7 +1037,7 @@ deferred to avoid an additional, potentially inconsistent identity snapshot.
 Illustrative shortened output (names and PIDs are examples):
 
 ```text
-PERMISSION HELL v1.4 | PROCESS AUDIT
+PERMISSION HELL v1.5 | PROCESS AUDIT
 Target: '/srv/private/secrets.db'
 Requested: READ
 
@@ -1042,7 +1190,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v1.4 | PROCESS DIAGNOSE
+PERMISSION HELL v1.5 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -1313,7 +1461,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v1.4 | AUDIT EXPLAIN
+PERMISSION HELL v1.5 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -1338,7 +1486,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v1.4 | AUDIT EXPLAIN
+PERMISSION HELL v1.5 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -1629,7 +1777,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v1.4 | ACCESS AUDIT
+PERMISSION HELL v1.5 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -1727,7 +1875,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v1.4 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.5 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1807,7 +1955,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v1.4 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.5 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)

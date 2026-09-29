@@ -21,7 +21,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 
 def display_version() -> str:
@@ -1457,6 +1457,22 @@ def main(argv: list[str] | None = None) -> int:
     diff_parser.add_argument("after")
     diff_parser.add_argument("--json", action="store_true", help="Emit every comparison as schema 1 JSON")
     diff_parser.add_argument("--verbose", action="store_true", help="Include unchanged subjects and full before/after observations")
+    for command in ("monitor-init", "monitor-check"):
+        monitor = commands.add_parser(command, help="Create a baseline" if command == "monitor-init" else "One-shot access change check")
+        monitor.add_argument("target_path")
+        monitor.add_argument("--baseline", required=True)
+        monitor.add_argument("--mode", choices=("r", "w", "x"), default="r" if command == "monitor-init" else None)
+        scope = monitor.add_mutually_exclusive_group()
+        scope.add_argument("--processes", dest="processes", action="store_true")
+        scope.add_argument("--accounts", dest="processes", action="store_false")
+        monitor.set_defaults(processes=False if command == "monitor-init" else None)
+        monitor.add_argument("--json", action="store_true")
+        if command == "monitor-init":
+            monitor.add_argument("--force", action="store_true")
+        else:
+            monitor.add_argument("--update-baseline", action="store_true")
+            monitor.add_argument("--verbose", action="store_true")
+            monitor.add_argument("--ignore-process-churn", action="store_true", help="Hide additions/removals in text only; exit code and JSON unchanged")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
@@ -1465,10 +1481,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "snapshot" and args.output == "":
         parser.error("--output must name a file")
     def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
-        if args.command in ("snapshot", "diff"):
+        if args.command in ("snapshot", "diff", "monitor-init", "monitor-check"):
             if args.json or args.command == "snapshot" and not args.output:
-                print(json_output.render_json({"schema_version": "1", "command": args.command,
-                      "tool_version": __version__, "exit_code": int(code), "errors": [message]}), end="")
+                error_document = {"schema_version": "1", "command": args.command,
+                                  "tool_version": __version__, "exit_code": int(code), "errors": [message]}
+                if args.command.startswith("monitor-"):
+                    error_document.update(baseline={"path": args.baseline}, baseline_updated=False)
+                print(json_output.render_json(error_document), end="")
             else:
                 print(f"permissionhell: {message}", file=sys.stderr)
             return
@@ -1518,6 +1537,37 @@ def main(argv: list[str] | None = None) -> int:
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command in ("monitor-init", "monitor-check"):
+            import access_monitor
+            import access_snapshot
+            try:
+                if args.command == "monitor-init":
+                    current = access_monitor.initialize(args.target_path, args.baseline, args.mode,
+                        processes=args.processes, force=args.force, engine=sys.modules[__name__])
+                    print(json_output.render_json(access_monitor.init_document(current, args.baseline, __version__)) if args.json
+                          else access_monitor.render_init(current, args.baseline))
+                    return current.code
+                result = access_monitor.check(args.target_path, args.baseline, mode=args.mode,
+                                               processes=args.processes, engine=sys.modules[__name__])
+                if not args.json:
+                    print(access_monitor.render_check(result, __version__, verbose=args.verbose,
+                                                      ignore_process_churn=args.ignore_process_churn), flush=True)
+                # Serialize the complete comparison before any replacement. JSON is
+                # emitted once afterward so baseline_updated reflects actual success.
+                if args.json:
+                    json_output.render_json(access_monitor.document(result, __version__))
+                if args.update_baseline:
+                    access_monitor.update_baseline(result)
+                    if not args.json:
+                        print("Baseline updated atomically." if result.baseline_updated else "Baseline update not performed.")
+                        for error in result.errors:
+                            print("Error: " + error)
+                if args.json:
+                    print(json_output.render_json(access_monitor.document(result, __version__)), end="")
+                return result.code
+            except access_snapshot.SnapshotError as exc:
+                emit_error(str(exc), exc.code)
+                return exc.code
         if args.command in ("snapshot", "diff"):
             import access_snapshot
             try:
