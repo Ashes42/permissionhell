@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 from capabilities import ProcessCapabilities, CapabilityError, STATUS_FIELDS, parse_capability_fields
+from idmap import IDMap, IDMapEntry, IDMapError
 
 try:
     import pwd
@@ -68,13 +69,6 @@ class RootObservation:
 
 
 @dataclass(frozen=True)
-class IDMapEntry:
-    inside: int
-    outside: int
-    length: int
-
-
-@dataclass(frozen=True)
 class ProcessSubject:
     pid: int
     start_time_ticks: int
@@ -87,13 +81,16 @@ class ProcessSubject:
     uid_map: tuple[IDMapEntry, ...] | None
     gid_map: tuple[IDMapEntry, ...] | None
     notes: tuple[str, ...] = ()
+    setgroups: str = "unavailable"
+    overflow_uid: int | None = None
+    overflow_gid: int | None = None
 
     @property
     def limitations(self) -> tuple[str, ...]:
         reasons = []
         for label, observation in (("mount namespace", self.mount_namespace),
                                    ("user namespace", self.user_namespace), ("root", self.root)):
-            if observation.matches_debugger is False:
+            if observation.matches_debugger is False and label != "user namespace":
                 reasons.append(f"PID {self.pid} has a different {label} from the debugger; "
                                "foreign namespaces/root mappings are not evaluated.")
             elif observation.matches_debugger is None:
@@ -133,24 +130,30 @@ def parse_status(text: str) -> ProcessStatus:
 
 
 def parse_id_map(text: str) -> tuple[IDMapEntry, ...]:
-    result = []
-    for line in text.splitlines():
-        fields = line.split()
-        if not fields:
-            continue
-        if len(fields) != 3 or any(not re.fullmatch(r"[0-9]{1,10}", field) for field in fields):
-            raise ProcessInspectionError("Malformed process UID/GID map")
-        inside, outside, length = map(int, fields)
-        if length <= 0 or inside + length > 0xFFFFFFFF or outside + length > 0xFFFFFFFF:
-            raise ProcessInspectionError("Invalid process UID/GID map range")
-        entry = IDMapEntry(inside, outside, length)
-        for previous in result:
-            if any(max(getattr(entry, key), getattr(previous, key)) <
-                   min(getattr(entry, key) + entry.length, getattr(previous, key) + previous.length)
-                   for key in ("inside", "outside")):
-                raise ProcessInspectionError("Overlapping process UID/GID map ranges")
-        result.append(entry)
-    return tuple(result)
+    try:
+        return IDMap.parse(text).entries
+    except IDMapError as exc:
+        raise ProcessInspectionError(str(exc)) from exc
+
+
+def parse_setgroups(text: str) -> str:
+    if text.strip() not in ("allow", "deny"):
+        raise ProcessInspectionError("Malformed setgroups state")
+    return text.strip()
+
+
+def read_setgroups(pid: int) -> str:
+    try:
+        return parse_setgroups(Path(f"/proc/{pid}/setgroups").read_text(encoding="ascii"))
+    except OSError:
+        return "unavailable"
+
+
+def read_overflow_id(kind: str) -> int | None:
+    try:
+        return numeric_id(Path(f"/proc/sys/kernel/overflow{kind}").read_text(encoding="ascii").strip())
+    except (OSError, ProcessInspectionError):
+        return None
 
 
 def read_text(path: str) -> str:
@@ -211,6 +214,9 @@ def inspect_process(pid: int) -> ProcessSubject:
     try:
         status = parse_status(read_text(f"/proc/{pid}/status"))
         mount_ns, user_ns, root = namespace(pid, "mnt"), namespace(pid, "user"), process_root(pid)
+        setgroups = read_setgroups(pid)
+        overflow_uid = read_overflow_id("uid") if user_ns.matches_debugger is False else None
+        overflow_gid = read_overflow_id("gid") if user_ns.matches_debugger is False else None
         notes = []
         maps = []
         for kind in ("uid", "gid"):
@@ -218,7 +224,8 @@ def inspect_process(pid: int) -> ProcessSubject:
                 maps.append(parse_id_map(read_text(f"/proc/{pid}/{kind}_map")))
             except PermissionError as exc:
                 maps.append(None)
-                notes.append(f"Cannot inspect {kind}_map (observational only): {exc}")
+                purpose = "required for foreign identity mapping" if user_ns.matches_debugger is False else "observational only"
+                notes.append(f"Cannot inspect {kind}_map ({purpose}): {exc}")
         if status.uids.filesystem is None:
             notes.append("fsuid unavailable: effective UID is the explicit filesystem-identity fallback.")
         if status.gids.filesystem is None:
@@ -231,6 +238,6 @@ def inspect_process(pid: int) -> ProcessSubject:
         if start_time(pid) != started or parse_status(read_text(f"/proc/{pid}/status")) != status:
             raise ProcessInspectionError(f"PID {pid} changed identity or credentials during inspection; retry")
         return ProcessSubject(pid, started, status, uid_names, gid_names, mount_ns, user_ns, root,
-                              maps[0], maps[1], tuple(notes))
+                              maps[0], maps[1], tuple(notes), setgroups, overflow_uid, overflow_gid)
     except OSError as exc:
         raise ProcessInspectionError(f"PID {pid} disappeared or proc metadata became inaccessible during inspection: {exc}") from exc

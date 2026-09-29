@@ -18,8 +18,9 @@ import sys
 import json_output
 from process_subject import ProcessSubject, ProcessInspectionError, inspect_process
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
+from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 
 def display_version() -> str:
@@ -47,9 +48,12 @@ OPERATIONS = {"r": (4, "READ"), "w": (2, "WRITE"), "x": (1, "EXECUTE/SEARCH")}
 
 
 class DiagnosticError(Exception):
-    def __init__(self, message: str, code: ExitCode = ExitCode.ERROR):
+    def __init__(self, message: str, code: ExitCode = ExitCode.ERROR, *, kind: str | None = None,
+                 partial_inode: Inode | None = None):
         super().__init__(message)
         self.code = code
+        self.kind = kind
+        self.partial_inode = partial_inode
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,9 @@ class Subject:
     process_identity: bool = False
     effective_capabilities: CapabilitySet | None = None
     capability_context_supported: bool = True
+    namespace_identity: NamespaceIdentity | None = None
+    uncertain_groups: bool = False
+    capability_context_reason: str | None = None
 
     @property
     def gids(self) -> frozenset[int]:
@@ -178,11 +185,32 @@ def inspect_inode(path: str, metadata: os.stat_result, subject: Subject, mode: s
     base = capability = None
     if subject.process_identity:
         base = decision
+        if subject.uncertain_groups and subject.uid != metadata.st_uid:
+            # Unknown groups must never become a grant or a false OTHER fallback.
+            # For single-bit requests, each possible matching group suffices to
+            # check whether an additional group could change the ordinary result.
+            candidates = {metadata.st_gid}
+            if acl and acl.extended:
+                candidates.update(entry.qualifier for entry in acl.entries if entry.tag == Tag.GROUP)
+            for gid in candidates:
+                if acl and acl.extended:
+                    alternative = evaluate_acl(acl, subject.uid, subject.gids | {gid}, metadata.st_uid,
+                                               metadata.st_gid, base.required)
+                else:
+                    alternative = evaluate_permission(replace(subject, supplementary_gids=(*subject.supplementary_gids, gid)),
+                                                      metadata, mode)
+                if alternative.allowed != base.allowed:
+                    raise DiagnosticError(f"Unresolved process GID translation could change DAC/ACL access at {path!r}.",
+                                          kind="group_mapping_unresolved")
         try:
             capability = evaluate_capabilities(base.allowed, metadata.st_mode, base.required,
-                                                subject.effective_capabilities, subject.capability_context_supported)
+                                                subject.effective_capabilities, subject.capability_context_supported,
+                                                context_reason=subject.capability_context_reason)
         except CapabilityError as exc:
-            raise DiagnosticError(f"Capability inspection at {path!r}: {exc}") from exc
+            kind = "capability_scope_unestablished" if subject.capability_context_reason else "capability_unknown"
+            partial = Inode(path, metadata.st_uid, metadata.st_gid, owner_name(metadata.st_uid),
+                            group_name(metadata.st_gid), metadata.st_mode, base, acl, match, note, dac, base)
+            raise DiagnosticError(f"Capability inspection at {path!r}: {exc}", kind=kind, partial_inode=partial) from exc
         decision = replace(base, allowed=capability.allowed, reason=base.reason + " " + capability.reason)
     return Inode(path, metadata.st_uid, metadata.st_gid, owner_name(metadata.st_uid),
                  group_name(metadata.st_gid), metadata.st_mode, decision, acl, match, note, dac, base, capability)
@@ -202,6 +230,8 @@ class PathTrace:
     resolved_path: str | None = None
     failure: str | None = None
     code: ExitCode | None = None
+    error_kind: str | None = None
+    partial_inode: Inode | None = None
 
 
 def trace_path(path: str, subject: Subject, mode: str) -> PathTrace:
@@ -261,6 +291,8 @@ def trace_path(path: str, subject: Subject, mode: str) -> PathTrace:
         trace.code = ExitCode.ERROR
     except DiagnosticError as exc:
         trace.failure, trace.code = str(exc), exc.code
+        trace.error_kind = exc.kind
+        trace.partial_inode = exc.partial_inode
     return trace
 
 
@@ -538,19 +570,29 @@ class ProcessDiagnosis:
     diagnosis: Diagnosis | None = None
     limitations: list[str] = field(default_factory=list)
     code: ExitCode = ExitCode.ERROR
+    namespace_identity: NamespaceIdentity | None = None
+    indeterminate_reason: str | None = None
 
 
 def process_filesystem_subject(process: ProcessSubject) -> Subject:
     """Adapt proc credentials to the existing DAC/ACL interface; no NSS groups."""
-    uid, gid = process.status.uids.used, process.status.gids.used
+    identity = namespace_identity(process)
+    if not identity.fsuid.mapped_ok:
+        raise DiagnosticError(f"Cannot establish filesystem UID mapping for observed debugger UID {identity.fsuid.observed}: "
+                              f"{identity.fsuid.reason}.", kind="uid_mapping_unresolved")
+    uid, gid = identity.fsuid.mapped, identity.fsgid.mapped
+    groups = tuple(g.mapped for g in identity.supplementary if g.mapped_ok)
+    uncertain_groups = not identity.fsgid.mapped_ok or any(not g.mapped_ok for g in identity.supplementary)
     # Conservative support boundary for capabilities: no namespace translation.
-    supported = all(mapping is not None and len(mapping) == 1 and
+    supported = identity.same_as_debugger is True and all(mapping is not None and len(mapping) == 1 and
                     (mapping[0].inside, mapping[0].outside, mapping[0].length) == (0, 0, 0xFFFFFFFF)
                     for mapping in (process.uid_map, process.gid_map))
-    return Subject(process.uid_names.get(uid) or str(uid), uid, gid, process.gid_names.get(gid) or str(gid),
-                   process.status.supplementary_gids,
-                   tuple(process.gid_names.get(g) or str(g) for g in process.status.supplementary_gids),
-                   True, process.status.capabilities.effective, supported)
+    reason = ("Capability scope over this debugger-visible inode cannot be established for a foreign user namespace."
+              if identity.same_as_debugger is False else None)
+    return Subject(process.uid_names.get(uid) or str(uid), uid, gid if gid is not None else -1,
+                   process.gid_names.get(gid) or (str(gid) if gid is not None else "unresolved"),
+                   groups, tuple(process.gid_names.get(g) or str(g) for g in groups),
+                   True, process.status.capabilities.effective, supported, identity, uncertain_groups, reason)
 
 
 def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
@@ -561,8 +603,10 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
         return report
     try:
         report.process = inspect_process(pid)
+        report.namespace_identity = namespace_identity(report.process)
         report.limitations.extend(report.process.limitations)
         if report.limitations:
+            report.indeterminate_reason = "path_context_unresolved"
             return report
         diagnosis = diagnose(path, process_filesystem_subject(report.process), mode)
         # Recheck identity, credentials, root and namespaces after the path walk.
@@ -574,9 +618,13 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
         if after != report.process:
             raise ProcessInspectionError(f"PID {pid} identity, credentials, or context changed during analysis; retry")
         report.diagnosis, report.code = diagnosis, diagnosis.code
-    except (ProcessInspectionError, DiagnosticError, OSError) as exc:
+        if diagnosis.code == ExitCode.ERROR:
+            report.indeterminate_reason = diagnosis.trace.error_kind or "diagnostic_error"
+    except (ProcessInspectionError, DiagnosticError, OSError, IDMapError) as exc:
         report.code = ExitCode(exc.code) if hasattr(exc, "code") else ExitCode.ERROR
         report.limitations.append(str(exc))
+        if report.code == ExitCode.ERROR:
+            report.indeterminate_reason = getattr(exc, "kind", None) or "process_inspection_failed"
     return report
 
 
@@ -1066,6 +1114,10 @@ def explanation_detail_lines(report: Diagnosis, verbose: bool = False, *, scope_
     else:
         lines.append("  Target not evaluated because path resolution/traversal stopped.")
     if trace.failure and not blocked:
+        if trace.partial_inode:
+            partial = trace.partial_inode
+            lines.append(f"  {partial.path!r}: base DAC/ACL {'PERMITTED' if partial.base_decision.allowed else 'DENIED'}; "
+                         "capability result UNKNOWN; no effective permission verdict.")
         lines.append(f"  {'FAIL' if report.code == ExitCode.DENIED else 'ERROR'}: {trace.failure} <-- STOPPED HERE")
     # The verdict engine places mount denials after the two target-denial reasons.
     # Consume those decisions, rather than reimplementing ro/noexec semantics here.
@@ -1099,10 +1151,14 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
     process = report.process
     if process:
         status = process.status
+        identity = report.namespace_identity
+        used_uid = identity.fsuid.mapped if identity else status.uids.used
+        used_gid = identity.fsgid.mapped if identity else status.gids.used
         lines.extend([f"Process: {status.name!r}", "", "PROCESS CREDENTIALS",
                       f"  ruid={status.uids.real} euid={status.uids.effective} suid={status.uids.saved} fsuid={status.uids.filesystem}",
                       f"  rgid={status.gids.real} egid={status.gids.effective} sgid={status.gids.saved} fsgid={status.gids.filesystem}",
-                      f"  Used for filesystem checks: UID {status.uids.used} ({status.uids.source}), GID {status.gids.used} ({status.gids.source})",
+                      f"  Used for filesystem checks: UID {used_uid if used_uid is not None else 'unresolved'} ({status.uids.source}), "
+                      f"GID {used_gid if used_gid is not None else 'unresolved'} ({status.gids.source})",
                       "  Supplementary: " + (", ".join(f"{process.gid_names.get(g) or g!r} (GID {g})" for g in status.supplementary_gids) or "none"),
                       "", "NAMESPACES"])
         for label, observation in (("mount", process.mount_namespace), ("user", process.user_namespace)):
@@ -1110,6 +1166,29 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
             lines.append(f"  {label}: {comparison} ({observation.identifier})")
         lines.extend([f"  root: {process.root.path!r} (matches debugger: {process.root.matches_debugger})",
                       "  Target interpretation: debugger's absolute path, root and mount namespace."])
+        if identity:
+            lines.extend(["", "USER NAMESPACE / FILESYSTEM IDENTITY"])
+            if identity.same_as_debugger is True:
+                lines.append("  Same user namespace; IDs interpreted directly.")
+            else:
+                lines.append("  Status IDs are debugger-visible; local IDs are recovered from the maps, not double-translated.")
+                for label, mapping in (("UID", process.uid_map), ("GID", process.gid_map)):
+                    display = mapping if verbose or mapping is None else mapping[:3]
+                    lines.append(f"  {label} map: " + ("unavailable" if display is None else "empty" if not display else
+                                 ", ".join(f"{e.inside}-{e.inside + e.length - 1} -> {e.outside}-{e.outside + e.length - 1}" for e in display)))
+                    if mapping is not None and not verbose and len(mapping) > 3:
+                        lines.append(f"    +{len(mapping) - 3} ranges (--verbose shows all)")
+                values = [("fsuid", identity.fsuid), ("fsgid", identity.fsgid)]
+                supplementary = identity.supplementary if verbose else identity.supplementary[:6]
+                values.extend(("supplementary", value) for value in supplementary)
+                for label, value in values:
+                    lines.append(f"  {label}: local {value.local if value.local is not None else 'unknown'} -> "
+                                 f"debugger ID {value.mapped if value.mapped_ok else 'unmapped/unresolved'} "
+                                 f"(observed {value.observed}" + (f"; {value.reason}" if value.reason else "") + ")")
+                if not verbose and len(identity.supplementary) > 6:
+                    lines.append(f"    +{len(identity.supplementary) - 6} supplementary translations (--verbose shows all)")
+                lines.append("  DAC/ACL uses mapped debugger-visible IDs, never namespace-local root as host root.")
+            lines.append(f"  setgroups: {process.setgroups} (does not remove currently observed memberships)")
         lines.extend("  Note: " + note for note in process.notes)
         sets = status.capabilities
         effective = sets.effective
@@ -1136,12 +1215,12 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
     lines.extend(["", f"RESULT: {result}"])
     if report.diagnosis:
         process_scope = ("Scope: live process fsuid/fsgid/groups, effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH; "
-                         "no UID-0 shortcut. Foreign namespaces, LSM policies and actual syscall success are not modeled.")
+                         "no UID-0 shortcut. Foreign capability scope, mount/root translation and LSM policies remain unmodeled.")
         lines.extend(["", "ACCESS PATH", *explanation_detail_lines(report.diagnosis, verbose, scope_text=process_scope)])
     else:
         lines.extend(["", "WHY", *report.limitations])
     lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL + effective DAC capabilities + mount restrictions.",
-                  "LSM policies, other capability effects, namespace translation and actual syscall success are not modeled.",
+                  "LSM policies, other capability effects, foreign capability scope and mount/root translation remain unmodeled.",
                   "Process snapshots are not atomic. Process remediation commands are not supported."])
     return "\n".join(lines)
 

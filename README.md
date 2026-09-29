@@ -5,10 +5,11 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.8 models Unix DAC, POSIX access ACLs, mount restrictions, and two effective
-DAC capabilities in process mode, not every Linux access-control layer.** SELinux,
-AppArmor, other capability effects, user-namespace translation,
-Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
+**v0.9 models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+identities across user namespaces, and two effective DAC capabilities in supported
+process contexts, not every Linux access-control layer.** SELinux,
+AppArmor, other capability effects, foreign mount/root path translation,
+container orchestration, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
 guarantee that a real process can perform it. Reports identify the DAC + ACL + mount
 model; `--verbose` and `--help` include the full scope and limitations.
@@ -116,19 +117,19 @@ targets are rejected (code 2); no process cwd or chroot-relative path translatio
 is attempted. `/proc/PID/root` is compared with the debugger's root using the
 observed paths and device/inode identity. Mount and user namespace identifiers
 are compared with `/proc/self/ns/mnt` and `/proc/self/ns/user`. A differing or
-uninspectable root, mount namespace, or user namespace prevents evaluation:
+uninspectable root or mount namespace, or an unknown user namespace, prevents evaluation:
 the result is **INDETERMINATE (3)**, never a fabricated permission denial.
 No `nsenter`, `setns`, chroot, or host/container path guessing occurs.
 Process-sensitive magic paths such as `/proc/self` retain the debugger's meaning;
 they are not translated into the inspected process's view.
 
-UID/GID maps are parsed and reported; they are never used to translate inode IDs.
-In a different user namespace the command conservatively stops even if a mapping
-looks simple. A map that cannot be read due to permissions is recorded as unknown;
-equal namespace identifiers still establish that no cross-namespace translation
-is being attempted. A capability bypass additionally requires full identity maps;
-unknown or non-identity maps make a needed bypass indeterminate. Missing proc
-metadata or a process disappearing during the snapshot produces an error.
+Different user namespaces can now use mapped filesystem identities for ordinary
+DAC/ACL checks, as described below. Inode IDs stay in the debugger's namespace.
+A map that cannot be read due to permissions is recorded as unknown; equal
+namespace identifiers establish that IDs can be compared directly. A same-user-
+namespace capability bypass still requires full identity maps; unknown or
+non-identity maps make a needed bypass indeterminate. Missing proc metadata or a
+process disappearing during the snapshot produces an error.
 
 The collector checks `/proc/PID/stat` start time to detect PID reuse and rereads
 credentials during collection. After permission analysis, it collects the process
@@ -141,7 +142,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v0.8 | PROCESS DIAGNOSE
+PERMISSION HELL v0.9 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -194,7 +195,7 @@ uses `verdict: "indeterminate"`; account-mode error verdicts are unchanged.
 their `filesystem` or `effective_fallback` source plus supplementary GIDs.
 `namespaces` and `root` expose identifiers, comparisons and inspection errors.
 Maps are arrays of `{inside, outside, length}` with
-`maps_used_for_authorization: false` (no ID translation). The capability layer
+`maps_used_for_authorization` indicating foreign-user-namespace mapping. The capability layer
 checks identity-map eligibility, and `capabilities_used_for_authorization` marks
 whether effective capabilities participate in the process model.
 Unknown names or observations are null. On a context limitation, access-path
@@ -273,10 +274,12 @@ capabilities can still pass ordinary owner/group/other or ACL checks, but cannot
 bypass a denial merely because its UID is zero. Account remediation is unchanged;
 the process API continues to produce no concrete remediation commands.
 
-**Conservative boundaries:** a foreign/unknown user or mount namespace or root
-still stops evaluation. Even within a shared user namespace, a needed capability
+**Conservative boundaries:** a foreign/unknown mount namespace or root, or an
+unknown user namespace, still stops evaluation. A foreign user namespace permits
+mapped ordinary DAC/ACL checks, but a needed capability bypass has unestablished
+scope and is indeterminate. Even within a shared user namespace, a needed capability
 bypass is indeterminate unless both observed UID/GID maps are the full identity
-range (inside=outside=0, length=4294967295). No namespace translation is attempted.
+range (inside=outside=0, length=4294967295).
 An unavailable CapEff, or unknown effective bits with no known applicable bypass,
 also makes an ordinary denial indeterminate. Ordinary allows remain allows without
 needing a capability; a known applicable bypass can still resolve a denial even
@@ -310,6 +313,81 @@ References: Linux [capabilities(7)](https://man7.org/linux/man-pages/man7/capabi
 the [UAPI capability numbering](https://github.com/torvalds/linux/blob/master/include/uapi/linux/capability.h),
 and [generic_permission](https://github.com/torvalds/linux/blob/master/fs/namei.c).
 
+## Namespace-aware process identities (v0.9)
+
+Use the existing `process /absolute/path --pid PID` command; `--verbose` shows
+complete map ranges and `--json` exposes structured translations. No namespace
+entry or privileged helper is needed. Paths must still have the same root and
+mount namespace as the debugger.
+
+**Linux reports `/proc/PID/status` IDs in the reader's user namespace, not the
+target's namespace.** With a foreign user namespace, the outside column of
+`uid_map`/`gid_map` is also relative to the reader. Permission Hell reverses each
+observed filesystem ID through its map to recover the namespace-local ID, then
+validates the forward translation. It does not translate an already mapped ID
+twice. For example, observed fsuid **100000** with `0 100000 65536` means local
+UID **0 → debugger UID 100000**. Observed fsuid 0 with that map is unresolved,
+not evidence of container root. These are debugger-visible IDs, not necessarily
+initial-host IDs when the debugger itself runs in a user namespace.
+
+When namespaces match, status IDs and inode IDs can be compared directly. In that
+case the maps' outside column describes the parent namespace and must not be
+applied to ordinary DAC/ACL comparisons. See the kernel's
+[status implementation](https://github.com/torvalds/linux/blob/master/fs/proc/array.c)
+and [user_namespaces(7)](https://man7.org/linux/man-pages/man7/user_namespaces.7.html).
+
+The reusable `idmap.py` parser supports disjoint ranges and both translation
+directions, and rejects malformed, overlapping, zero-length, or overflowing
+ranges. Empty maps contain no mappings. Filesystem UID, primary GID and each live
+supplementary GID retain their observed, local and mapped values. DAC ownership,
+owning groups and named ACL entries use only valid debugger-visible mapped IDs.
+Namespace-local UID zero never implies privileged account root.
+
+An unresolved filesystem UID prevents authorization. An unresolved primary or
+supplementary GID makes a step indeterminate only if a possible additional group
+match could change its result. Owner and named-user precedence still apply;
+known group grants can remain definitive. Unknown groups cannot silently grant
+access or incorrectly allow fallback to OTHER. Linux can collapse unrepresentable
+IDs to an overflow ID: foreign-namespace observations equal to the configured
+overflow UID/GID are conservatively unresolved, even if that number might also
+be legitimate. Unreadable overflow markers likewise prevent safe translation.
+
+`/proc/PID/setgroups` is reported as `allow`, `deny`, or `unavailable`. It describes
+whether group changes are allowed; `deny` does not remove existing supplementary
+groups. The tool always evaluates the captured live list and never changes it.
+
+Examples assuming traversable parents and no restrictive mount:
+
+| Process and target | Modeled result |
+| --- | --- |
+| Local UID 0 maps to 100000; target owner 0, mode 0600; CapEff empty | DENIED through OTHER; local root is not debugger root |
+| Supplementary GID 10 maps to 100010; target group 100010, mode 0640 | PERMITTED through GROUP |
+| Foreign user namespace, ordinary DAC denial, effective CAP_DAC_OVERRIDE | INDETERMINATE (3): capability scope over this inode is unestablished |
+| Same user namespace with full identity maps, ordinary denial, effective CAP_DAC_OVERRIDE | PERMITTED for an applicable bypass |
+
+Foreign namespace capabilities do not act as debugger-namespace privileges.
+An ordinary DAC/ACL permit needs no bypass and remains usable. A capability that
+cannot authorize the requested operation (such as READ_SEARCH for write) does
+not erase a definitive denial. Mount restrictions continue to apply.
+
+JSON stays at schema **1** with additive fields:
+
+- `process.credential_id_namespace` identifies the debugger view of raw status IDs.
+- `process.user_namespace` contains comparison, maps, outside-column context and setgroups.
+- `process.filesystem_identity.fsuid`, `.fsgid` and `.supplementary_groups` contain
+  `observed`, `local`, `mapped`, `mapped_ok`, direction, matched range and reason.
+- Inode `identity_used` explains mapped IDs and their source. Unknown IDs are null.
+- `indeterminate_reason` identifies incomplete analysis; `unresolved_inode`, when
+  available, preserves a known base DAC/ACL decision without fabricating a final
+  permission result when capability scope is unknown.
+
+Snapshots revalidate maps, credentials, namespaces and root but remain non-atomic.
+Foreign mount/root translation, idmapped mounts, nested capability scope and
+filesystem-specific authorization remain unsupported. Map and namespace data can
+reveal container identity relationships; review reports before sharing them.
+Inspection stays read-only: no setns/nsenter, namespace creation, setgroups,
+map writes, capability changes, remounts or process remediation commands.
+
 ## Focused audit explanations (v0.4)
 
 ```bash
@@ -335,7 +413,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.8 | AUDIT EXPLAIN
+PERMISSION HELL v0.9 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -360,7 +438,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.8 | AUDIT EXPLAIN
+PERMISSION HELL v0.9 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -651,7 +729,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.8 | ACCESS AUDIT
+PERMISSION HELL v0.9 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -749,7 +827,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.8 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.9 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -829,7 +907,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.8 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.9 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -999,6 +1077,7 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | --- | --- |
 | CLI | `main()` |
 | Identity | `resolve_subject()` / `Subject` |
+| Namespace identity mapping | `IDMap`, `IDTranslation`, `NamespaceIdentity` in `idmap.py` |
 | Permission engine | `evaluate_permission()` / `PermissionDecision` |
 | ACL inspection and selection | `read_access_acl()`, `evaluate_acl()` / `AccessACL`, `ACLMatch` |
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
@@ -1043,8 +1122,8 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Audit account filtering.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
-- Capability-aware process checks and safely evaluating foreign namespaces.
-- Container mappings and filesystem-specific behavior.
+- Establishing capability scope in foreign user namespaces.
+- Foreign mount/root path contexts, idmapped mounts and filesystem-specific behavior.
 
 Semantics references: Linux [path_resolution(7)](https://man7.org/linux/man-pages/man7/path_resolution.7.html)
 and [symlink(7)](https://man7.org/linux/man-pages/man7/symlink.7.html).

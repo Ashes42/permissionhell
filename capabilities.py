@@ -77,7 +77,8 @@ class CapabilityDecision:
 
 
 def evaluate_capabilities(base_allowed: bool, inode_mode: int, required: int,
-                          effective: CapabilitySet | None, context_supported: bool = True) -> CapabilityDecision:
+                          effective: CapabilitySet | None, context_supported: bool = True, *,
+                          context_reason: str | None = None) -> CapabilityDecision:
     """Apply Linux generic_permission's DAC bypasses after a known DAC/ACL result.
 
     Mount restrictions remain the verdict engine's responsibility. Unknown ACLs
@@ -96,7 +97,7 @@ def evaluate_capabilities(base_allowed: bool, inode_mode: int, required: int,
         capability = "CAP_DAC_OVERRIDE"
     if capability:
         if not context_supported:
-            raise CapabilityError("Capability bypass requires supported UID/GID namespace mappings; "
+            raise CapabilityError(context_reason or "Capability bypass requires supported UID/GID namespace mappings; "
                                   "non-identity or unavailable maps are not interpreted.")
         detail = " (READ/SEARCH only)" if capability == "CAP_DAC_READ_SEARCH" else ""
         return CapabilityDecision(False, True, capability, f"{capability}{detail} bypasses the ordinary DAC/ACL denial.")

@@ -14,7 +14,7 @@ dependencies = []
 permissionhell = "permissionhell:main"
 
 [tool.setuptools]
-py-modules = ["permissionhell", "posix_acl", "json_output", "process_subject", "capabilities"]
+py-modules = ["permissionhell", "posix_acl", "json_output", "process_subject", "capabilities", "idmap"]
 
 [tool.setuptools.dynamic]
 version = {attr = "permissionhell.__version__"}

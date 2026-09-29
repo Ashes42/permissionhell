@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import stat
+from idmap import namespace_identity
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -35,8 +36,9 @@ def envelope(version: str, command: str, mode: str, path: str, requested_mode: s
 
 
 def subject_data(subject: Subject) -> dict:
-    return {"username": subject.username, "uid": subject.uid, "primary_gid": subject.primary_gid,
-            "primary_group": subject.primary_group,
+    unknown_gid = subject.namespace_identity is not None and not subject.namespace_identity.fsgid.mapped_ok
+    return {"username": subject.username, "uid": subject.uid, "primary_gid": None if unknown_gid else subject.primary_gid,
+            "primary_group": None if unknown_gid else subject.primary_group,
             "supplementary_groups": [{"gid": gid, "name": name}
                                      for gid, name in zip(subject.supplementary_gids, subject.supplementary_groups)]}
 
@@ -78,8 +80,18 @@ def inode_data(inode: Inode, subject: Subject, stage: str, blocker: bool = False
         capability = inode.capability_decision
         result.update({"base_result": "permitted" if inode.base_decision.allowed else "denied",
                        "base_mechanism": "posix_acl" if acl else "unix_dac",
-                       "capability_override": {"capability": capability.capability, "applied": capability.applied,
-                                               "reason": capability.reason}})
+                       "capability_override": {"capability": capability.capability if capability else None,
+                                               "applied": capability.applied if capability else False,
+                                               "reason": capability.reason if capability else "Capability scope/result unresolved"}})
+        if capability is None:
+            result["result"] = "unknown"
+    if subject.namespace_identity:
+        result["identity_used"] = {"uid": subject.uid, "gid": subject.namespace_identity.fsgid.mapped,
+                                   "supplementary_gids": list(subject.supplementary_gids),
+                                   "source": "same_user_namespace" if subject.namespace_identity.same_as_debugger else "mapped_foreign_user_namespace",
+                                   "local_fsuid": subject.namespace_identity.fsuid.local,
+                                   "local_fsgid": subject.namespace_identity.fsgid.local,
+                                   "unresolved_groups": subject.uncertain_groups}
     return result
 
 
@@ -121,12 +133,17 @@ def diagnosis_data(report: Diagnosis) -> dict:
                   "noexec": "noexec" in mount.options if mount else None, "reasons": mount_reasons}
     if report.trace.failure and report.trace.code in (2, 3):
         errors.append(error_data(report.trace.failure, report.trace.code, "path"))
+        if report.trace.error_kind:
+            errors[-1]["reason_code"] = report.trace.error_kind
     if report.code in (2, 3) and not errors:
         errors.extend(error_data(reason, report.code, "diagnosis") for reason in report.reasons)
-    return {"subject": subject_data(report.subject), "resolved_target_path": report.trace.resolved_path,
+    result = {"subject": subject_data(report.subject), "resolved_target_path": report.trace.resolved_path,
             "access_path": events, "target_inode": target_data, "mount": mount_data,
             "first_blocker": first_blocker, "verdict": VERDICTS[report.code], "exit_code": int(report.code),
             "reasons": list(report.reasons), "errors": errors}
+    if report.trace.partial_inode:
+        result["unresolved_inode"] = inode_data(report.trace.partial_inode, report.subject, "inspection")
+    return result
 
 
 def remediation_data(suggestions: list[RemediationSuggestion]) -> list[dict]:
@@ -207,21 +224,35 @@ def process_subject_data(process: ProcessSubject) -> dict:
     def mappings(entries):
         return [{"inside": e.inside, "outside": e.outside, "length": e.length} for e in entries] if entries is not None else None
     root = process.root
+    identity = namespace_identity(process)
+    def translated(value):
+        entry = value.matched_range
+        return {"observed": value.observed, "local": value.local, "mapped": value.mapped, "mapped_ok": value.mapped_ok,
+                "direction": value.direction, "reason": value.reason,
+                "matched_range": {"inside": entry.inside, "outside": entry.outside, "length": entry.length} if entry else None}
     return {"pid": process.pid, "name": status.name, "start_time_ticks": process.start_time_ticks,
             "credentials": {"uids": credentials(status.uids, process.uid_names),
                             "gids": credentials(status.gids, process.gid_names),
                             "supplementary_groups": [{"gid": g, "name": process.gid_names.get(g)} for g in status.supplementary_gids]},
-            "filesystem_identity": {"uid": status.uids.used, "gid": status.gids.used,
+            "credential_id_namespace": "debugger_user_namespace",
+            "user_namespace": {"same_as_debugger": identity.same_as_debugger,
+                               "uid_map": mappings(process.uid_map), "gid_map": mappings(process.gid_map),
+                               "setgroups": process.setgroups,
+                               "outside_column_namespace": ("parent" if identity.same_as_debugger is True else
+                                                            "debugger" if identity.same_as_debugger is False else None)},
+            "filesystem_identity": {"uid": identity.fsuid.mapped, "gid": identity.fsgid.mapped,
                                     "uid_source": status.uids.source, "gid_source": status.gids.source,
-                                    "supplementary_gids": list(status.supplementary_gids)},
+                                    "supplementary_gids": [g.mapped for g in identity.supplementary if g.mapped_ok],
+                                    "fsuid": translated(identity.fsuid), "fsgid": translated(identity.fsgid),
+                                    "supplementary_groups": [translated(g) for g in identity.supplementary]},
             "namespaces": {"mount": namespace(process.mount_namespace), "user": namespace(process.user_namespace)},
             "root": {"path": root.path, "device": root.device, "inode": root.inode,
                      "debugger_path": root.debugger_path, "debugger_device": root.debugger_device,
                      "debugger_inode": root.debugger_inode, "matches_debugger": root.matches_debugger, "error": root.error},
             "uid_map": mappings(process.uid_map), "gid_map": mappings(process.gid_map),
-            "maps_used_for_authorization": False, "effective_capabilities": status.effective_capabilities,
+            "maps_used_for_authorization": identity.same_as_debugger is False, "effective_capabilities": status.effective_capabilities,
             "capabilities": capabilities_data(status.capabilities),
-            "capabilities_used_for_authorization": status.capabilities.effective is not None and not process.limitations,
+            "capabilities_used_for_authorization": status.capabilities.effective is not None and identity.same_as_debugger is True and not process.limitations,
             "notes": list(process.notes)}
 
 
@@ -235,9 +266,11 @@ def process_document(report: ProcessDiagnosis, version: str) -> dict:
     result.update({"pid": report.pid, "process": process_subject_data(report.process) if report.process else None,
                    "path_context": "debugger_absolute_path_root_and_mount_namespace",
                    "limitations": list(report.limitations),
+                   "indeterminate_reason": report.indeterminate_reason,
                    "model_limitations": ["Only effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH affect r/w/x; LSM policies remain unmodeled.",
                                          "Live UID 0 has no implicit bypass. Non-identity or unknown namespace maps cannot authorize capability bypasses.",
-                                         "Foreign user/mount namespaces and roots are not entered or mapped.",
+                                         "Foreign user IDs are validated in the debugger's namespace; foreign capability scope is not established.",
+                                         "Foreign mount namespaces and roots are not entered or translated.",
                                          "Snapshots are not atomic; no guarantee of actual syscall success.",
                                          "Process remediation is not supported."],
                    "verdict": "indeterminate" if report.code == 3 else VERDICTS[report.code], "exit_code": int(report.code)})
