@@ -20,7 +20,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 
 def display_version() -> str:
@@ -1404,10 +1404,29 @@ def main(argv: list[str] | None = None) -> int:
     process_audit.add_argument("--json", action="store_true", help="Include every process individually as schema 1 JSON")
     process_audit.add_argument("--verbose", action="store_true",
                                help="Expand all processes, full reasoning and readable command lines (may contain secrets)")
+    graph_parser = commands.add_parser("graph", help="Graph one account or process access decision",
+                                       epilog="Representation of the access model, not kernel tracing. DOT is emitted only; Graphviz is never executed.")
+    graph_parser.add_argument("target_path")
+    identity = graph_parser.add_mutually_exclusive_group(required=True)
+    identity.add_argument("--as", dest="username", help="Account to graph")
+    identity.add_argument("--pid", type=pid_argument, help="Running process to graph (absolute targets only)")
+    graph_parser.add_argument("--mode", choices=OPERATIONS, default="r")
+    exports = graph_parser.add_mutually_exclusive_group()
+    exports.add_argument("--json", action="store_true", help="Emit graph schema 1 with every node and edge")
+    exports.add_argument("--dot", action="store_true", help="Emit Graphviz DOT without running Graphviz")
+    graph_parser.add_argument("--verbose", action="store_true", help="Expand traversal and show collected graph metadata")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
     def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
+        if args.command == "graph":
+            import access_graph
+            document = json_output.error_document(__version__, "graph", "graph", args.target_path,
+                                                   args.mode, args.username, message, code, stage)
+            if args.pid is not None:
+                document["pid"] = args.pid
+            emit_graph(access_graph.build_graph(document))
+            return
         if args.json:
             username = args.username if args.command == "diagnose" else getattr(args, "explain", None)
             mode = "explain" if args.command == "audit" and args.explain is not None else args.command
@@ -1422,10 +1441,28 @@ def main(argv: list[str] | None = None) -> int:
             print(json_output.render_json(document), end="")
         else:
             print(f"permissionhell: {message}", file=sys.stderr)
+    def emit_graph(graph) -> None:
+        import access_graph
+        if args.json:
+            print(access_graph.serialize_graph_json(graph), end="")
+        elif args.dot:
+            print(access_graph.serialize_graph_dot(graph), end="")
+        else:
+            print(access_graph.render_terminal_graph(graph, verbose=args.verbose))
     if not sys.platform.startswith("linux"):
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command == "graph":
+            import access_graph
+            if args.pid is not None:
+                report = diagnose_process(args.target_path, args.pid, args.mode)
+                graph = access_graph.build_process_graph(report, __version__)
+            else:
+                report = diagnose(args.target_path, resolve_subject(args.username), args.mode)
+                graph = access_graph.build_account_graph(report, __version__)
+            emit_graph(graph)
+            return report.code
         if args.command == "audit-processes":
             import process_audit
             engine = sys.modules[__name__]

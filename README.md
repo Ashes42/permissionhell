@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v1.0 adds visible-process access auditing and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.1 adds terminal, JSON and DOT access graphs and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
 process contexts, not every Linux access-control layer.** SELinux,
 AppArmor, other capability effects, foreign mount/root path translation,
@@ -47,6 +47,8 @@ python3 permissionhell.py audit TARGET_PATH [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py audit TARGET_PATH --explain USERNAME [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py process ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json]
 python3 permissionhell.py audit-processes ABSOLUTE_TARGET [--pid PID ...] [--mode {r,w,x}] [--verbose] [--json]
+python3 permissionhell.py graph TARGET --as USERNAME [--mode {r,w,x}] [--verbose] [--json | --dot]
+python3 permissionhell.py graph ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json | --dot]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -84,6 +86,187 @@ a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
 
+## Visual access graphs (v1.1)
+
+```bash
+permissionhell graph /srv/private/secrets.db --as www-data --mode r
+permissionhell graph /srv/private/secrets.db --pid 812 --mode r
+permissionhell graph /srv/private/secrets.db --pid 812 --verbose
+permissionhell graph /srv/private/secrets.db --pid 812 --json
+permissionhell graph /srv/private/secrets.db --pid 812 --dot
+```
+
+Choose exactly one identity (`--as` or `--pid`) and at most one export format.
+The default is a plain-text graph with ASCII arrows and explicit status labels;
+it requires neither color nor a TTY. Account paths follow existing diagnose path
+rules; process paths must be absolute in the debugger's root/mount namespace.
+Exit codes and access decisions are inherited unchanged from the corresponding
+single-account or single-process diagnosis.
+
+**This is a representation of Permission Hell's access model, not kernel tracing.**
+The builder consumes collected structured decisions; it neither re-evaluates
+permissions nor scrapes human explanations. It performs no additional filesystem
+inspection. A modeled PERMITTED result still does not guarantee syscall success.
+
+For example, an ordinary owner check appears in the chain as:
+
+```text
+[NEUTRAL] UID 9000, primary GID 100
+  |
+  v
+[NEUTRAL] '/data/file' (target)
+  |
+  v
+[NEUTRAL] Owner UID 9000; GID 500; mode 0644
+  |
+  v
+[PASS] UID matches owner -> OWNER rw-: PERMITTED
+```
+
+GROUP selection includes matched primary/supplementary GIDs before the GROUP
+permission decision. ACL graphs retain selected entries, any group union, the
+mask and the effective permission decision in order. Example excerpts:
+
+```text
+ACL NAMED USER: user:1001:rw-
+  -> ACL mask: r-- (removes requested permission)
+  -> Effective ACL r--: DENIED <-- BLOCKER
+
+Matched supplementary GID 200 'media'
+  -> ACL GROUP: group:200:r--
+  -> Matched group union: r--
+  -> ACL mask: r--
+  -> Effective ACL r--: PERMITTED
+```
+
+A process capability bypass never hides the underlying denial:
+
+```text
+[FAIL] no owner or group match -> OTHER ---: DENIED
+  |
+  v
+[OVERRIDE] CAP_DAC_OVERRIDE overrides base denial
+  |
+  v
+[PASS] Effective access PERMITTED
+  |
+  v
+[PASS] Mount '/': rw
+  |
+  v
+[PASS] READ PERMITTED
+```
+
+The base denial above is **not** marked as a final blocker. If the request is
+WRITE on a read-only mount, its tail instead becomes:
+
+```text
+[PASS] Effective access PERMITTED
+  |
+  v
+[FAIL] Mount '/': ro <-- BLOCKER
+  |
+  v
+[FAIL] WRITE DENIED
+```
+
+Namespace mapping precedes ownership/group selection, for example:
+
+```text
+Local fsuid 0, fsgid 0
+  -> Mapped fsuid 100000, fsgid 100000 (debugger view)
+  -> target owner UID 0
+  -> no owner or group match -> OTHER ---: DENIED
+```
+
+Same-user-namespace graphs show direct IDs without inventing a translation.
+Unknown mappings, inaccessible metadata and unestablished capability scope retain
+unknown/error states. A stopped trace never fabricates later target decisions.
+Account root is explicitly labeled as the traditional privileged-root assumption;
+process UID zero continues to depend on observed capabilities.
+
+The compact terminal renderer collapses consecutive ordinary OTHER search passes
+only when their class and available bits agree. It lists the paths and component
+count. Blockers, ACL decisions, root assumptions, capability overrides and symlinks
+remain visible. `--verbose` expands every component and prints collected metadata:
+groups, selected/unmatched observed ACL entries, maps, capability sets, mount
+options and reasons. ACLs skipped by the engine are labeled as such, not read just
+for graphing. Exported JSON and DOT always retain the complete graph; verbose does
+not change export detail.
+
+### Graph JSON schema 1
+
+Graph exports have a separate envelope; existing diagnosis/audit JSON is unchanged.
+The envelope contains `schema_version: "1"`, `graph_version: "1"`, `command: "graph"`,
+tool/version, target path, requested mode, `result`, `exit_code`, `nodes`, `edges`
+and `spine`. `spine` is the ordered main causal chain; additional edges connect
+identity/group/context observations to their consumers.
+
+- Node: `id`, `type`, `label`, `status`, `metadata`.
+- Edge: `from`, `to`, `type`; both endpoints reference existing node IDs.
+- Status: `pass`, `fail`, `override`, `neutral`, `indeterminate`, `unavailable`, or `error`.
+- Result: the original engine verdict (`permitted`, `denied`, `indeterminate`,
+  `error`, or `invalid_input`), with its original exit code.
+
+Types include user/process, filesystem_identity, namespace, supplementary_group,
+directory/target, ownership, group, acl, capability, symlink, mount, context,
+decision and blocker. Edge types include maps_to, member_of, traverses,
+resolves_to, selects, grants, denies, overrides, constrained_by, has_context and
+results_in. Metadata preserves collected observations and display hints, including
+`blocker`, traversal step/path and collapse eligibility. Context-only nodes are
+off the spine and expanded beneath their identity in verbose terminal output.
+
+Example node and edge fragments:
+
+```json
+{
+  "graph_version": "1",
+  "nodes": [
+    {"id": "identity:local", "type": "filesystem_identity", "label": "Local fsuid 0, fsgid 0", "status": "neutral", "metadata": {}},
+    {"id": "identity:filesystem", "type": "filesystem_identity", "label": "Mapped fsuid 100000, fsgid 100000 (debugger view)", "status": "neutral", "metadata": {}}
+  ],
+  "edges": [{"from": "identity:local", "to": "identity:filesystem", "type": "maps_to"}]
+}
+```
+
+IDs and ordering are deterministic for the same collected result. Repeated path
+visits use ordered IDs such as `step:2:path` to stay unique; process and final
+decision nodes use semantic IDs such as `process:812` and `decision:final`.
+These IDs identify observations within a result, not persistent kernel objects.
+JSON safely escapes hostile paths/names and preserves unavailable values as null.
+
+### DOT export
+
+`--dot` emits a complete directed Graphviz graph using quoted IDs/labels,
+explicit status text and typed edges. Example excerpt:
+
+```dot
+digraph permissionhell {
+  "step:2:base" [label="[FAIL] OTHER ---: DENIED", shape=box];
+  "step:2:capability" [label="[OVERRIDE] CAP_DAC_OVERRIDE", shape=box];
+  "step:2:base" -> "step:2:capability" [label="overrides"];
+}
+```
+
+Graphviz is **not required, installed or executed** by Permission Hell. Output
+goes to stdout; exporting does not itself create an output file. Quoted labels
+escape quotes, backslashes and control characters. Graph results remain meaningful
+without colors or Graphviz rendering.
+
+### Graph privacy and deferred features
+
+Graphs can expose account/process names, PIDs, paths, group/ACL identities,
+namespace mappings and capabilities. Review exports before sharing them. Graphing
+does not read target contents, command lines, environment variables or process
+memory. It does not modify files, processes, namespaces, mappings, capabilities,
+mounts or security settings. The normal Python bytecode-cache caveat still applies.
+
+v1.1 intentionally supports **one account or one process** per graph. Process-audit
+summary graphs, browser/interactive views, automatic image generation and Graphviz
+execution are deferred. Use `audit-processes` to discover PIDs, then `graph --pid`
+for a focused view. Existing namespace, capability, ACL and filesystem limitations
+remain unchanged.
+
 ## Process/resource access audit (v1.0)
 
 ```bash
@@ -114,7 +297,7 @@ deferred to avoid an additional, potentially inconsistent identity snapshot.
 Illustrative shortened output (names and PIDs are examples):
 
 ```text
-PERMISSION HELL v1.0 | PROCESS AUDIT
+PERMISSION HELL v1.1 | PROCESS AUDIT
 Target: '/srv/private/secrets.db'
 Requested: READ
 
@@ -267,7 +450,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v1.0 | PROCESS DIAGNOSE
+PERMISSION HELL v1.1 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -538,7 +721,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v1.0 | AUDIT EXPLAIN
+PERMISSION HELL v1.1 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -563,7 +746,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v1.0 | AUDIT EXPLAIN
+PERMISSION HELL v1.1 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -854,7 +1037,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v1.0 | ACCESS AUDIT
+PERMISSION HELL v1.1 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -952,7 +1135,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v1.0 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.1 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1032,7 +1215,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v1.0 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.1 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1204,6 +1387,7 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | Identity | `resolve_subject()` / `Subject` |
 | Namespace identity mapping | `IDMap`, `IDTranslation`, `NamespaceIdentity` in `idmap.py` |
 | Process inventory and access audit | `audit_processes()` / `ProcessAuditResult`, `ProcessAuditEntry`, `ProcessAuditSummary` in `process_audit.py` |
+| Access graph model and exports | `AccessGraph`, `GraphNode`, `GraphEdge`, graph builders and terminal/JSON/DOT serializers in `access_graph.py` |
 | Permission engine | `evaluate_permission()` / `PermissionDecision` |
 | ACL inspection and selection | `read_access_acl()`, `evaluate_acl()` / `AccessACL`, `ACLMatch` |
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
@@ -1247,6 +1431,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Formal JSON Schema validation and streaming large audit results.
 - Audit account filtering.
 - Process-audit UID/name filtering with explicit snapshot semantics.
+- Process-audit summary graphs and optional interactive graph views.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Establishing capability scope in foreign user namespaces.
