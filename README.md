@@ -8,7 +8,8 @@ class applies to the target, and whether its mount adds a restriction.
 layer.** POSIX ACLs, SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
-guarantee that a real process can perform it. Every report states this scope.
+guarantee that a real process can perform it. Reports identify the DAC + mount
+model; `--verbose` and `--help` include the full scope and limitations.
 
 ## Installation
 
@@ -38,12 +39,18 @@ standard library. Unsupported operating systems report a clear error, while
 ## Usage
 
 ```bash
-python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}]
+python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}] [--verbose]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
 python3 permissionhell.py diagnose /opt/scripts/backup.sh --as backup --mode x
+python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --verbose
 ```
+
+Default output leads with the verdict and its reason, then shows compact PASS/FAIL
+search checks, target metadata, and a single mount summary. `BLOCKED HERE` marks
+the first failing inode. `--verbose` restores every search observation, detailed
+per-inode reasoning, group memberships, all mount options, and model limitations.
 
 The default mode is `r`. Read (`r`), write (`w`), and execute/search (`x`) each
 request one permission on an **existing inode**. This is not a create, delete,
@@ -64,54 +71,32 @@ still evaluates the supplied subject.
 
 ## Example output
 
-Illustrative excerpt for a subject whose group permits traversal but whose
+Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.1
-Diagnosing READ access
+PERMISSION HELL v0.1 | READ as navidrome (UID 1001)
+Target: '/srv/music/song.flac'
 
-SUBJECT
-User: navidrome (UID 1001)
-Primary group: navidrome (GID 1001)
-Supplementary groups: media (2000)
-
-TARGET
-'/srv/music/song.flac'
-
-PATH TRAVERSAL
-PASS '/'  OTHER r-x  requires x  UID=0 GID=0 mode=0755
-     Subject is neither the inode owner nor a member of its owning group. Only OTHER bits apply; no fallback to another class. EXECUTE/SEARCH permitted by this DAC model.
-PASS '/srv'  GROUP r-x  requires x  UID=0 GID=2000 mode=0750
-     Inode GID 2000 matches the subject's primary or supplementary groups. Only GROUP bits apply; no fallback to another class. EXECUTE/SEARCH permitted by this DAC model.
-PASS '/srv/music'  GROUP r-x  requires x  UID=1000 GID=2000 mode=0750
-     Inode GID 2000 matches the subject's primary or supplementary groups. Only GROUP bits apply; no fallback to another class. EXECUTE/SEARCH permitted by this DAC model.
-
-TARGET INODE
-Resolved path: '/srv/music/song.flac'
-Owner: ash (UID 1000)
-Group: ash (GID 1000)
-Mode: 0640 (-rw-r-----)
-Matched class: OTHER
-Required: READ (r)
-Available: ---
-DAC: DENIED
-Subject is neither the inode owner nor a member of its owning group. Only OTHER bits apply; no fallback to another class. READ denied by this DAC model.
-
-MOUNT
-Mount point: '/srv'
-Filesystem: ext4
-Mount options: relatime,rw
-Filesystem options: rw
-Status: READ-WRITE
-
-ACCESS DENIED (v0.1 DAC + mount model)
+ACCESS DENIED (DAC + mount model)
 navidrome lacks READ permission on '/srv/music/song.flac'.
+OTHER selected: subject is neither owner nor in the owning group. Its --- bits lack r; no fallback to another class.
+
+PATH (search x)
+  PASS '/'  OTHER r-x
+  PASS '/srv'  GROUP r-x
+  PASS '/srv/music'  GROUP r-x
+
+TARGET FAIL '/srv/music/song.flac'  <-- BLOCKED HERE
+  Owner: ash (1000) | Group: ash (1000) | Mode: 0640 (-rw-r-----)
+  Access: OTHER --- | Required: READ (r)
+Mount: '/srv' | ext4 | READ-WRITE
 ```
 
-Reports additionally print the model's limitations. If a parent fails search,
-the report identifies that exact directory, preserves earlier steps, and marks
-the target and mount as unevaluated because resolution did not complete.
+Successful checks instead start with `ACCESS PERMITTED` and a short explanation
+that directory search, target access, and mount checks pass. If a parent fails
+search, the report identifies that exact directory, preserves earlier steps, and
+marks the target and mount as unevaluated because resolution did not complete.
 
 ## How access is evaluated
 
@@ -119,7 +104,7 @@ the target and mount as unevaluated because resolution did not complete.
 
 User and group names come from Python's `pwd` and `grp` interfaces to the system
 account database. `os.getgrouplist()` resolves primary and supplementary group
-membership. The report lists primary and supplementary names and numeric IDs;
+membership. The verbose report lists primary and supplementary names and numeric IDs;
 unmapped inode owners or groups are displayed numerically.
 
 For each inode, select exactly one class:
@@ -163,8 +148,9 @@ v0.1 assumes UID 0 is **traditional privileged root**, with the usual DAC bypass
 read/write and directory search are permitted regardless of ordinary mode bits.
 For execution of a non-directory inode, at least one OWNER, GROUP, or OTHER
 execute bit must be present. Mount `ro` and `noexec` restrictions still apply.
-The selected ordinary permission class remains visible, and the reason explains
-the root assumption. Dropped capabilities and namespace-restricted root are not
+The report leads with `ROOT OVERRIDE` when a check uses that bypass, or `ROOT`
+otherwise, with the ordinary class shown in brackets for context. It explicitly
+states the privileged-root assumption. Dropped capabilities and namespace-restricted root are not
 modeled; UID 0 alone does not establish actual process capabilities.
 
 ### Symlink policy
@@ -175,6 +161,11 @@ destination appears in the ordered trace. Absolute destinations restart at `/`;
 relative destinations start at the link's containing directory. Required search
 checks along both the original path and the link destination are retained. A
 successful trace shows the final resolved path.
+
+The concise display omits repeated identical successful directory checks and
+notes how many were omitted. It never suppresses a failed or changed observation.
+`--verbose` shows the full ordered trace; this display choice does not change
+resolution or permission evaluation.
 
 The limit is 40 followed links, matching Linux's ordinary pathname resolution
 limit. Missing destinations report a possible broken link and preserve the link
@@ -192,6 +183,9 @@ Definitions are centralized in `ExitCode` in `permissionhell.py`.
 | 1 | Requested access denied by a modeled check |
 | 2 | Invalid CLI/input: malformed arguments, unknown user, missing component, broken/looping link, non-directory component |
 | 3 | Diagnostic/system error: inaccessible metadata, unavailable mount information without an established denial, unsupported platform |
+
+Broken links and other unresolved paths display `UNRESOLVED PATH`, while keeping
+exit code 2. Malformed CLI arguments and empty/NUL paths remain invalid input.
 
 ## Safety and limitations
 
@@ -230,7 +224,7 @@ The single importable module keeps separate layers:
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
 | Mount inspection | `read_mounts()`, `find_mount()` / `Mount` |
 | Verdict | `diagnose()`, `determine_verdict()` / `Diagnosis` |
-| Presentation | `render_report()` |
+| Presentation | `render_report(report, verbose=False)`, `render_verbose_report()` |
 
 The engine returns dataclasses; only the renderer formats terminal output.
 
@@ -244,6 +238,9 @@ Unit tests mock identities, metadata, and mounts for deterministic precedence,
 root, traversal, symlink, failure, and mount checks. A Linux integration test uses
 a temporary file and relative symlink, the current account, real mountinfo, and a
 CLI subprocess. Tests never change system users or mounts.
+Rendering tests cover concise and verbose output, blocker explanations, root
+labels, symlink display, scope visibility, CLI flag routing, and unchanged exit
+codes. The original 43 semantic/CLI tests are preserved.
 
 ## Roadmap
 

@@ -315,7 +315,116 @@ def bits(value: int) -> str:
     return "".join(letter if value & bit else "-" for bit, letter in ((4, "r"), (2, "w"), (1, "x")))
 
 
-def render_report(report: Diagnosis) -> str:
+SCOPE_TEXT = (
+    "Scope: account database groups; debugger's mount namespace; traditional privileged root.\n"
+    "Not modeled: POSIX ACLs, SELinux, AppArmor, process capabilities, user namespaces,\n"
+    "container UID/GID mappings, NFS/SMB/FUSE rules, inode flags, or other process restrictions.\n"
+    "This is a read-only model, not a guarantee that an actual syscall will succeed."
+)
+
+
+def verdict_label(report: Diagnosis) -> str:
+    # A path that cannot resolve is not necessarily malformed CLI input.
+    # This presentation distinction intentionally leaves the exit code unchanged.
+    if report.code == ExitCode.INPUT and report.requested_path and "\x00" not in report.requested_path:
+        return "UNRESOLVED PATH"
+    return {ExitCode.ALLOWED: "ACCESS PERMITTED", ExitCode.DENIED: "ACCESS DENIED",
+            ExitCode.INPUT: "INVALID INPUT", ExitCode.ERROR: "DIAGNOSIS INCOMPLETE"}[report.code]
+
+
+def access_summary(inode: Inode, subject: Subject) -> str:
+    decision = inode.decision
+    ordinary = f"{decision.permission_class} {bits(decision.available)}"
+    if subject.uid == 0:
+        label = "ROOT OVERRIDE" if decision.root_override else "ROOT"
+        return f"{label} [ordinary {ordinary}]"
+    return ordinary
+
+
+def denial_explanation(inode: Inode, subject: Subject) -> str:
+    decision = inode.decision
+    if subject.uid == 0:
+        return "Root still needs at least one execute bit on a non-directory inode; none is set."
+    selected = decision.permission_class
+    why = {"OWNER": f"UID {subject.uid} owns this inode",
+           "GROUP": f"subject belongs to owning GID {inode.gid}",
+           "OTHER": "subject is neither owner nor in the owning group"}[selected]
+    return (f"{selected} selected: {why}. Its {bits(decision.available)} bits lack "
+            f"{bits(decision.required).replace('-', '')}; no fallback to another class.")
+
+
+def concise_reasons(report: Diagnosis) -> list[str]:
+    if report.code == ExitCode.ALLOWED:
+        return ["Directory search and target access pass; no applicable mount restriction."]
+    if report.trace.failure:
+        lines = [report.trace.failure]
+        blocked = next((event for event in report.trace.events
+                        if isinstance(event, Inode) and not event.decision.allowed), None)
+        if blocked:
+            lines.append(denial_explanation(blocked, report.subject))
+        return lines
+    target = report.trace.target
+    # Retain the verdict engine's reasons (including all mount restrictions),
+    # replacing only its long DAC paragraph with a compact explanation.
+    return [denial_explanation(target, report.subject)
+            if target and reason == target.decision.reason else reason
+            for reason in report.reasons]
+
+
+def render_report(report: Diagnosis, verbose: bool = False) -> str:
+    if verbose:
+        return render_verbose_report(report)
+    subject, target = report.subject, report.trace.target
+    path = repr(report.requested_path)
+    if report.trace.resolved_path is not None and report.trace.resolved_path != report.requested_path:
+        path += f" -> {report.trace.resolved_path!r}"
+    lines = [f"PERMISSION HELL v0.1 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
+             f"Target: {path}", "", f"{verdict_label(report)} (DAC + mount model)",
+             *concise_reasons(report)]
+    if subject.uid == 0:
+        lines.append("Root: assumes privileged UID 0; DAC bypasses are marked ROOT OVERRIDE.")
+    lines.extend(["", "PATH (search x)"])
+    seen = set()
+    repeated = 0
+    for event in report.trace.events:
+        if isinstance(event, Symlink):
+            lines.append(f"  LINK {event.path!r} -> {event.destination!r}")
+            continue
+        # Collapse only identical successful observations; never hide a failure
+        # or a changed inode. The full event sequence remains available in verbose.
+        if event.decision.allowed and event in seen:
+            repeated += 1
+            continue
+        seen.add(event)
+        status = "PASS" if event.decision.allowed else "FAIL"
+        marker = "" if event.decision.allowed else "  <-- BLOCKED HERE"
+        lines.append(f"  {status} {event.path!r}  {access_summary(event, subject)}{marker}")
+    if repeated:
+        lines.append(f"  ({repeated} repeated successful search checks omitted; --verbose shows all)")
+    if not report.trace.events:
+        lines.append("  No parent search steps." if target else "  Resolution did not start.")
+    lines.append("")
+    if target:
+        status = "PASS" if target.decision.allowed else "FAIL"
+        marker = "" if target.decision.allowed else "  <-- BLOCKED HERE"
+        lines.extend([f"TARGET {status} {target.path!r}{marker}",
+                      f"  Owner: {target.owner} ({target.uid}) | Group: {target.group} ({target.gid})"
+                      f" | Mode: {stat.S_IMODE(target.mode):04o} ({stat.filemode(target.mode)})",
+                      f"  Access: {access_summary(target, subject)} | Required: {OPERATIONS[report.mode][1]} ({report.mode})"])
+    else:
+        lines.append("Target and mount not evaluated: path traversal did not complete.")
+    if report.mount:
+        mount = report.mount
+        options = "READ-ONLY" if mount.readonly else "READ-WRITE"
+        if "noexec" in mount.options:
+            options += ", noexec"
+        lines.append(f"Mount: {mount.point!r} | {mount.filesystem} | {options}")
+    if report.mount_error:
+        lines.append(f"Mount inspection error: {report.mount_error}")
+    return "\n".join(lines)
+
+
+def render_verbose_report(report: Diagnosis) -> str:
     subject = report.subject
     lines = ["PERMISSION HELL v0.1", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
              "SUBJECT", f"User: {subject.username} (UID {subject.uid})",
@@ -328,8 +437,8 @@ def render_report(report: Diagnosis) -> str:
             lines.append(f"LINK {event.path!r} -> {event.destination!r}")
             continue
         decision = event.decision
-        lines.extend([f"{'PASS' if decision.allowed else 'FAIL'} {event.path!r}  {decision.permission_class}"
-                      f" {bits(decision.available)}  requires x"
+        lines.extend([f"{'PASS' if decision.allowed else 'FAIL'} {event.path!r}  {access_summary(event, subject)}"
+                      f"  requires x"
                       f"  UID={event.uid} GID={event.gid} mode={stat.S_IMODE(event.mode):04o}",
                       f"     {decision.reason}"])
     if not report.trace.events:
@@ -340,7 +449,7 @@ def render_report(report: Diagnosis) -> str:
         lines.extend([f"Resolved path: {report.trace.resolved_path!r}",
                       f"Owner: {target.owner} (UID {target.uid})", f"Group: {target.group} (GID {target.gid})",
                       f"Mode: {stat.S_IMODE(target.mode):04o} ({stat.filemode(target.mode)})",
-                      f"Matched class: {target.decision.permission_class}",
+                      f"Access: {access_summary(target, subject)}",
                       f"Required: {OPERATIONS[report.mode][1]} ({report.mode})",
                       f"Available: {bits(target.decision.available)}",
                       f"DAC: {'PERMITTED' if target.decision.allowed else 'DENIED'}",
@@ -356,24 +465,20 @@ def render_report(report: Diagnosis) -> str:
                       f"Status: {'READ-ONLY' if mount.readonly else 'READ-WRITE'}"])
     else:
         lines.append(report.mount_error or "Not evaluated: target path was not resolved.")
-    label = {ExitCode.ALLOWED: "ACCESS PERMITTED", ExitCode.DENIED: "ACCESS DENIED",
-             ExitCode.INPUT: "INVALID INPUT", ExitCode.ERROR: "DIAGNOSIS INCOMPLETE"}[report.code]
-    lines.extend(["", label + " (v0.1 DAC + mount model)", *report.reasons, "",
-                  "Scope: account database groups; debugger's mount namespace; traditional privileged root.",
-                  "Not modeled: POSIX ACLs, SELinux, AppArmor, process capabilities, user namespaces,",
-                  "container UID/GID mappings, NFS/SMB/FUSE rules, inode flags, or other process restrictions.",
-                  "This is a read-only model, not a guarantee that an actual syscall will succeed."])
+    lines.extend(["", verdict_label(report) + " (v0.1 DAC + mount model)", *report.reasons, "", SCOPE_TEXT])
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__)
+    parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
     parser.add_argument("--version", action="version", version="permissionhell 0.1.0")
     commands = parser.add_subparsers(dest="command", required=True)
-    command = commands.add_parser("diagnose", help="Explain Linux DAC and mount access decisions")
+    command = commands.add_parser("diagnose", help="Explain Linux DAC and mount access decisions", epilog=SCOPE_TEXT)
     command.add_argument("target_path")
     command.add_argument("--as", dest="username", required=True, help="Account to evaluate")
     command.add_argument("--mode", choices=OPERATIONS, default="r")
+    command.add_argument("--verbose", action="store_true",
+                         help="Show all traversal checks, detailed reasoning, groups, mount options, and limitations")
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux"):
         print("permissionhell: unsupported platform; diagnosis requires Linux.", file=sys.stderr)
@@ -381,7 +486,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         subject = resolve_subject(args.username)
         report = diagnose(args.target_path, subject, args.mode)
-        print(render_report(report))
+        print(render_report(report, verbose=args.verbose))
         return report.code
     except (DiagnosticError, OSError) as exc:
         print(f"permissionhell: {exc}", file=sys.stderr)
