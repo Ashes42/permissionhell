@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.4 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
+**v0.5 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
 access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
@@ -105,7 +105,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.4 | AUDIT EXPLAIN
+PERMISSION HELL v0.5 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -130,7 +130,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.4 | AUDIT EXPLAIN
+PERMISSION HELL v0.5 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -162,9 +162,97 @@ completes, even if some or all accounts are denied; it returns 2 for invalid
 input/path and 3 for incomplete inspection. A known denial remains definitive
 even when mount inspection is unavailable, with that limitation shown.
 
-The package and `--version` report **0.4.0**. Existing diagnose and normal-audit
-renderers retain their v0.3 banners/output for compatibility; the focused report
-uses a v0.4 banner. The permission model is unchanged.
+The canonical version is `permissionhell.__version__`. Package metadata and
+`--version` use its full value (**0.5.0**); all report headings derive their compact
+label (**v0.5**) from it. Nonzero patch versions remain visible (for example,
+`0.5.1` displays as `v0.5.1`). The permission model is unchanged.
+
+## Informational change suggestions (v0.5)
+
+```bash
+permissionhell audit /srv/data/file.db --explain www-data --mode w --suggest-fixes
+permissionhell audit /srv/data/file.db --explain www-data --suggest-fixes --verbose
+```
+
+`--suggest-fixes` requires `--explain USER`. It appends structured alternatives
+to the focused report without changing the verdict or exit code. Denied access
+produces ways to address the first inode blocker and any known mount restriction;
+permitted access produces ways to narrow or remove the modeled permission.
+
+**Suggestions are informational text only and are never executed.** There is no
+interactive prompt or apply-fix command. No chmod, chown, setfacl, group change,
+remount, or other modifying operation runs. Commands are quoted for a POSIX shell,
+with option termination before paths. Reinspect the current state before manually
+using any command; diagnostics are observations, not an atomic snapshot.
+
+Alternatives describe scope and tradeoffs, not intended organizational policy or
+a universally best fix. Each identifies affected identities/objects and relevant
+privilege requirements. Commands are alternatives, not a script to run in sequence.
+For example, a WRITE denial through OTHER on a plain 0600 file can show:
+
+```text
+RESULT: DENIED
+POSSIBLE CHANGES
+
+BROADER MODE CHANGE
+  Grant OTHER w on '/srv/data/file.db'
+    chmod o+w -- /srv/data/file.db
+  Effect: Changes rights for every account using OTHER, not just the subject.
+
+NARROW CHANGE
+  Set a named-user access ACL
+    setfacl -n -m u:www-data:-w-,m::-w- -- /srv/data/file.db
+  Effect: Changes the named account's entry while preserving the owning-group entry.
+```
+
+For READ access already permitted through OTHER on a plain 0644 file:
+
+```text
+RESULT: PERMITTED
+POSSIBLE CHANGES
+
+BROADER MODE CHANGE
+  Remove OTHER r on '/srv/data/file.db'
+    chmod o-r -- /srv/data/file.db
+  Effect: Changes rights for every account using OTHER, not just the subject.
+
+NARROW CHANGE
+  Set a named-user access ACL
+    setfacl -n -m u:www-data:---,m::r-- -- /srv/data/file.db
+  Effect: The named entry prevents fallback to OTHER; existing group rights remain.
+```
+
+These excerpts omit the repeated caveats shown by the command. Inode changes
+require owner or administrator authority; account membership changes require
+account administration and refreshed process credentials. Group changes can
+affect access to other resources. Directory `x` means search/traversal and changes
+reachability of descendants. Every suggested change needs a fresh full-path check.
+
+For existing named-user ACLs, generated edits preserve the mask with `setfacl -n`.
+A mask expansion is a separate alternative and explicitly warns that **all
+mask-governed named-user and group ACL entries** may gain effective rights.
+For reductions, retaining a restrictive named entry prevents fallback; simply
+deleting it could restore access via GROUP or OTHER. Matching-group ACL redesign
+is conceptual because multiple entries can contribute to the group union.
+With extended ACLs, `chmod g` edits the shared mask, so no ordinary group-bit
+command is inferred for that case.
+
+Read-only/noexec mount guidance identifies the filesystem restriction and its
+system-wide scope without inventing a remount command. File mode changes alone
+cannot overcome it. Root execution guidance preserves the existing execute-bit
+rule; ordinary DAC/ACL reductions do not reliably revoke privileged root access.
+Unknown diagnostic states receive no concrete permission commands.
+
+Suggestions cover only the existing DAC, ACL, traversal, group, mount, and
+traditional-root model. They do not model intended policy or suggest changes to
+SELinux, AppArmor, capabilities, namespaces, containers, or filesystem-specific
+controls. No ownership reassignment is inferred. Filesystem ACL support and
+unchanged identity/metadata state must be verified before manually applying ACLs.
+
+`RemediationSuggestion` holds category, title, commands, effect, and caveats.
+`suggest_remediations()` consumes a `Diagnosis` without mutation or extra system
+inspection; a separate renderer formats it. Package/CLI version is **0.5.0**;
+all explanation and diagnostic banners use the same canonical version source.
 
 ## Local-account access audits
 
@@ -198,7 +286,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.3 | ACCESS AUDIT
+PERMISSION HELL v0.5 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -296,7 +384,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.3 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.5 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -376,7 +464,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.3 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.5 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)

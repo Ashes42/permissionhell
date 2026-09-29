@@ -308,7 +308,7 @@ class AuditTest(unittest.TestCase):
     def test_compact_output_counts_and_mechanisms(self):
         result = ph.audit_target("/srv/file")
         text = ph.render_audit(result)
-        self.assertIn("PERMISSION HELL v0.3 | ACCESS AUDIT", text)
+        self.assertIn(f"PERMISSION HELL {ph.display_version()} | ACCESS AUDIT", text)
         self.assertIn("Requested: READ (r)", text)
         self.assertIn("3 accounts permitted | 1 account denied | 0 account errors", text)
         self.assertIn("Access via OWNER", text)

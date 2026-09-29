@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Permission Hell v0.4: read-only Linux access diagnosis and local-account audits."""
+"""Permission Hell: read-only Linux access diagnosis and change suggestions."""
 
 from __future__ import annotations
 
@@ -11,8 +11,16 @@ from enum import IntEnum
 import errno
 import os
 import re
+import shlex
 import stat
 import sys
+
+__version__ = "0.5.0"
+
+
+def display_version() -> str:
+    """Compact release label derived from the package's canonical version."""
+    return "v" + (__version__[:-2] if __version__.endswith(".0") else __version__)
 
 from posix_acl import (AccessACL, ACLEntry, ACLMatch, ACLInspectionError, Tag,
                        evaluate_acl, read_access_acl, validate_acl_mode)
@@ -633,7 +641,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
     path = repr(report.requested_path)
     if report.trace.resolved_path is not None and report.trace.resolved_path != report.requested_path:
         path += f" -> {report.trace.resolved_path!r}"
-    lines = [f"PERMISSION HELL v0.3 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
+    lines = [f"PERMISSION HELL {display_version()} | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
              f"Target: {path}", "", f"{verdict_label(report)} (DAC + ACL + mount model)",
              *concise_reasons(report)]
     if subject.uid == 0:
@@ -687,7 +695,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
 
 def render_verbose_report(report: Diagnosis) -> str:
     subject = report.subject
-    lines = ["PERMISSION HELL v0.3", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
+    lines = [f"PERMISSION HELL {display_version()}", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
              "SUBJECT", f"User: {subject.username} (UID {subject.uid})",
              f"Primary group: {subject.primary_group} (GID {subject.primary_gid})",
              "Supplementary groups: " + (", ".join(f"{name} ({gid})" for name, gid in
@@ -728,7 +736,7 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"Status: {'READ-ONLY' if mount.readonly else 'READ-WRITE'}"])
     else:
         lines.append(report.mount_error or "Not evaluated: target path was not resolved.")
-    lines.extend(["", verdict_label(report) + " (v0.3 DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
+    lines.extend(["", verdict_label(report) + f" ({display_version()} DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
     return "\n".join(lines)
 
 
@@ -861,7 +869,7 @@ def audit_display_groups(accounts: list[AccountAudit], verbose: bool = False) ->
 
 def render_audit(report: AuditReport, verbose: bool = False) -> str:
     operation = OPERATIONS[report.mode][1]
-    lines = ["PERMISSION HELL v0.3 | ACCESS AUDIT", f"Target: {report.requested_path!r}",
+    lines = [f"PERMISSION HELL {display_version()} | ACCESS AUDIT", f"Target: {report.requested_path!r}",
              f"Requested: {operation} ({report.mode})", "Local accounts: /etc/passwd (including service accounts)", ""]
     resolved = sorted({result.diagnosis.trace.resolved_path
                        for result in report.permitted + report.denied + report.errors
@@ -936,7 +944,7 @@ def render_audit_explanation(explanation: AuditExplanation, verbose: bool = Fals
     subject, trace = report.subject, report.trace
     result = {ExitCode.ALLOWED: "PERMITTED", ExitCode.DENIED: "DENIED",
               ExitCode.INPUT: "UNRESOLVED PATH / INVALID INPUT", ExitCode.ERROR: "INCOMPLETE"}[report.code]
-    lines = ["PERMISSION HELL v0.4 | AUDIT EXPLAIN", f"Target: {report.requested_path!r}",
+    lines = [f"PERMISSION HELL {display_version()} | AUDIT EXPLAIN", f"Target: {report.requested_path!r}",
              f"Subject: {subject.username} (UID {subject.uid})",
              f"Requested: {OPERATIONS[report.mode][1]}", "", f"RESULT: {result}", "", "ACCESS PATH"]
     if subject.uid == 0:
@@ -993,9 +1001,140 @@ def render_audit_explanation(explanation: AuditExplanation, verbose: bool = Fals
     return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class RemediationSuggestion:
+    category: str
+    title: str
+    commands: tuple[str, ...]
+    effect: str
+    caveats: tuple[str, ...] = ()
+
+
+def suggest_remediations(report: Diagnosis) -> list[RemediationSuggestion]:
+    """Read existing decisions; generate alternatives, never run commands or probe state.
+
+    ACL group redesign and mount changes intentionally remain conceptual: an
+    observed access check does not establish policy or a safe persistent layout.
+    """
+    suggestions = []
+    if report.code not in (ExitCode.ALLOWED, ExitCode.DENIED):
+        return [RemediationSuggestion("STRUCTURAL CHANGE", "Resolve the inspection failure first", (),
+                "No reliable permission change can be derived from an incomplete diagnosis.")]
+    subject = report.subject
+    blocked = next((event for event in report.trace.events
+                    if isinstance(event, Inode) and not event.decision.allowed), None)
+    inode = blocked or report.trace.target
+    granting = report.code == ExitCode.DENIED
+    if inode is None:
+        return [RemediationSuggestion("STRUCTURAL CHANGE", "Inspect the unresolved blocker", (),
+                "No concrete permission command can be derived from this result.")]
+    # Mount reasons are already verdict-engine output; do not reevaluate mounts.
+    mount_reasons = report.reasons[2:] if report.trace.target and not report.trace.target.decision.allowed else report.reasons
+    if granting and not report.trace.failure and report.mount:
+        for reason in mount_reasons:
+            if reason.startswith("Mount "):
+                suggestions.append(RemediationSuggestion("SYSTEM-LEVEL CHANGE", "Review the mount restriction", (),
+                    reason + " Inode permission changes alone cannot overcome this restriction.",
+                    ("An administrator can review whether to use a filesystem with the required access policy; "
+                     "changing mount policy affects all users and objects on that mount. No remount command is inferred.",)))
+    if granting and inode.decision.allowed:
+        return suggestions or [RemediationSuggestion("STRUCTURAL CHANGE", "Review the reported blocker", (),
+                              "No concrete permission change is supported by this diagnosis.")]
+    required = inode.decision.required
+    letter = bits(required).replace("-", "")
+    operation = "grant" if granting else "remove"
+    path = inode.path
+    # '--' protects option-like operands, quoting protects shell metacharacters.
+    def command(*args: str) -> str:
+        return shlex.join(args)
+    caveats = ["Commands are alternatives, not a sequence. The owner or an administrator must authorize inode changes.",
+               "Recheck the complete path afterward; another traversal, ACL, or mount check may still block access."]
+    if stat.S_ISDIR(inode.mode):
+        caveats.append("Directory x means search/traversal; changing it affects reachable descendants, not file execution.")
+    if subject.uid == 0:
+        if granting:
+            suggestions.append(RemediationSuggestion("BROADER MODE CHANGE", "Set an execute bit if execution is intended",
+                (command("chmod", "u+x", "--", path),),
+                "Root requires at least one execute bit on this non-directory inode. This also grants execute to its owner.",
+                tuple(caveats)))
+        else:
+            suggestions.append(RemediationSuggestion("STRUCTURAL CHANGE", "Review use of a privileged identity", (),
+                "Under the traditional UID 0 model, ordinary DAC/ACL reductions do not reliably revoke root access.",
+                ("An administrator can arrange execution under a non-root identity and evaluate that identity separately.",)))
+        return suggestions
+    match = inode.acl_match
+    qualifier = subject.username if subject.username and not any(c in subject.username for c in ":,\n") else str(subject.uid)
+    if acl_relevant(inode):
+        if granting and match.mask is not None and match.specified & required and not match.effective & required:
+            suggestions.append(RemediationSuggestion("GROUP-LEVEL CHANGE", "Expand the ACL mask",
+                (command("setfacl", "-n", "-m", "m::" + bits(match.mask | required), "--", path),),
+                "This can expand effective rights for ALL mask-governed named-user and group ACL entries, not only this account.",
+                tuple(caveats)))
+        if match.selection == "NAMED USER":
+            permissions = (match.specified | required) if granting else (match.specified & ~required)
+            if permissions != match.specified:
+                suggestions.append(RemediationSuggestion("NARROW CHANGE", f"{operation.capitalize()} the named account's ACL permission",
+                    (command("setfacl", "-n", "-m", f"u:{qualifier}:{bits(permissions)}", "--", path),),
+                    f"Changes only {subject.username} (UID {subject.uid})'s entry on {path!r}; keeps the existing mask.",
+                    tuple(caveats + (["The mask must also allow the requested permission; changing it can affect every mask-governed entry."]
+                                    if granting else ["Keeping the entry prevents fallback. Deleting it instead may restore access through GROUP or OTHER."]))))
+        else:
+            suggestions.append(RemediationSuggestion("GROUP-LEVEL CHANGE", "Review matching ACL groups and their union", (),
+                "Changing a matching group entry affects its members; multiple matching groups contribute to the union.",
+                tuple(caveats + ["To remove access, every contributing route must be considered. The mask governs all named users and groups."])))
+        suggestions.append(RemediationSuggestion("STRUCTURAL CHANGE", "Review the ACL and group design", (),
+            "If group sharing is intended, review membership and matching entries together; no ownership or group reassignment is inferred.",
+            ("Group membership changes require account administration, affect other resources using that group, and require refreshed process credentials.",)))
+        return suggestions
+    selected = inode.decision.permission_class
+    if selected == "GROUP" and inode.acl and inode.acl.extended:
+        return suggestions + [RemediationSuggestion("GROUP-LEVEL CHANGE", "Review the owning-group ACL entry and mask", (),
+            "With an extended ACL, chmod g changes the shared mask rather than just the owning-group entry. "
+            "Review both before changing access; all mask-governed entries can be affected.", tuple(caveats))]
+    selector = {"OWNER": "u", "GROUP": "g", "OTHER": "o"}[selected]
+    suggestions.append(RemediationSuggestion("GROUP-LEVEL CHANGE" if selected == "GROUP" else "BROADER MODE CHANGE",
+        f"{operation.capitalize()} {selected} {letter} on {path!r}",
+        (command("chmod", selector + ("+" if granting else "-") + letter, "--", path),),
+        {"OWNER": "Changes rights for the owning UID, including other accounts sharing that UID.",
+         "GROUP": "Changes rights for every account using the owning-group class.",
+         "OTHER": "Changes rights for every account using OTHER, not just the subject."}[selected], tuple(caveats)))
+    if selected != "OWNER":
+        if not inode.acl or not inode.acl.extended:
+            permissions = inode.decision.available | required if granting else inode.decision.available & ~required
+            mask = ((inode.mode >> 3) & 7) | (required if granting else 0)
+            suggestions.append(RemediationSuggestion("NARROW CHANGE", "Set a named-user access ACL",
+                (command("setfacl", "-n", "-m", f"u:{qualifier}:{bits(permissions)},m::{bits(mask)}", "--", path),),
+                f"Changes the access entry for {subject.username} (UID {subject.uid}) while preserving the existing owning-group entry. "
+                "The explicit mask preserves current group rights; the named entry prevents fallback to OTHER.",
+                tuple(caveats + ["Requires filesystem ACL support. Review the current ACL again before applying: a changed ACL could make this mask affect other entries."])))
+        # For extended ACLs whose OTHER path was selected, use conceptual guidance
+        # rather than chmod g (which would edit the mask) or guessing a new mask.
+        if granting and inode.acl and inode.acl.extended:
+            suggestions.append(RemediationSuggestion("NARROW CHANGE", "Consider a named-user access ACL", (),
+                f"An entry for {subject.username} (UID {subject.uid}) could grant access on {path!r} without widening OTHER.",
+                tuple(caveats + ["Preserve intended existing rights and inspect the ACL mask first. Automatic mask recalculation can widen rights for other named users and groups."])))
+        if inode.gid in subject.supplementary_gids or granting:
+            suggestions.append(RemediationSuggestion("GROUP-LEVEL CHANGE", "Review supplementary group membership", (),
+                f"Owning group: {inode.group} (GID {inode.gid}). "
+                + ("Membership can select GROUP, but that class must grant the permission; OWNER takes precedence."
+                   if granting else "Removing membership may narrow access, but OTHER or another matching ACL group may still permit it."),
+                ("Membership changes require account administration and refreshed process credentials; they affect every resource using that group.",)))
+    return suggestions
+
+
+def render_remediations(suggestions: list[RemediationSuggestion]) -> str:
+    lines = ["POSSIBLE CHANGES", "Informational alternatives only; no commands are executed."]
+    for suggestion in suggestions:
+        lines.extend(["", suggestion.category, "  " + suggestion.title])
+        lines.extend("    " + command for command in suggestion.commands)
+        lines.append("  Effect: " + suggestion.effect)
+        lines.extend("  Note: " + caveat for caveat in suggestion.caveats)
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
-    parser.add_argument("--version", action="version", version="permissionhell 0.4.0")
+    parser.add_argument("--version", action="version", version=f"permissionhell {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("diagnose", help="Explain Linux DAC, ACL, and mount access decisions", epilog=SCOPE_TEXT)
     command.add_argument("target_path")
@@ -1008,9 +1147,12 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("target_path")
     audit.add_argument("--mode", choices=OPERATIONS, default="r")
     audit.add_argument("--explain", metavar="USER", help="Explain one named account's ordered access path")
+    audit.add_argument("--suggest-fixes", action="store_true", help="With --explain, show informational change alternatives; never execute them")
     audit.add_argument("--verbose", action="store_true",
                        help="Show every account without grouping; with --explain, add full diagnostic detail")
     args = parser.parse_args(argv)
+    if args.command == "audit" and args.suggest_fixes and args.explain is None:
+        parser.error("--suggest-fixes requires --explain USER")
     if not sys.platform.startswith("linux"):
         print("permissionhell: unsupported platform; diagnosis requires Linux.", file=sys.stderr)
         return ExitCode.ERROR
@@ -1019,6 +1161,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.explain is not None:
                 explanation = explain_audit_target(args.target_path, args.explain, args.mode)
                 print(render_audit_explanation(explanation, verbose=args.verbose))
+                if args.suggest_fixes:
+                    print("\n" + render_remediations(suggest_remediations(explanation.diagnosis)))
                 return explanation.code
             audit_report = audit_target(args.target_path, args.mode)
             print(render_audit(audit_report, verbose=args.verbose))

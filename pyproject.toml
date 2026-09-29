@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "permissionhell"
-version = "0.4.0"
+dynamic = ["version"]
 description = "Read-only Linux access diagnosis and local-account audits with Unix DAC, POSIX ACLs, and mount restrictions"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,3 +15,6 @@ permissionhell = "permissionhell:main"
 
 [tool.setuptools]
 py-modules = ["permissionhell", "posix_acl"]
+
+[tool.setuptools.dynamic]
+version = {attr = "permissionhell.__version__"}
