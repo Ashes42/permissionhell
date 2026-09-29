@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v1.1 adds terminal, JSON and DOT access graphs and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.2 adds intended-policy versus effective-access drift checking and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
 process contexts, not every Linux access-control layer.** SELinux,
 AppArmor, other capability effects, foreign mount/root path translation,
@@ -49,6 +49,7 @@ python3 permissionhell.py process ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--
 python3 permissionhell.py audit-processes ABSOLUTE_TARGET [--pid PID ...] [--mode {r,w,x}] [--verbose] [--json]
 python3 permissionhell.py graph TARGET --as USERNAME [--mode {r,w,x}] [--verbose] [--json | --dot]
 python3 permissionhell.py graph ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json | --dot]
+python3 permissionhell.py policy-check POLICY_FILE [--verbose] [--json]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -85,6 +86,238 @@ An unprivileged debugger may be unable to read necessary metadata. That produces
 a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
+
+## Intended-policy versus effective-access drift (v1.2)
+
+```bash
+permissionhell policy-check policy.json
+permissionhell policy-check policy.json --json
+permissionhell policy-check policy.json --verbose
+```
+
+`policy-check` compares explicit intentions with the existing account/process
+access models. It does not enforce policy, change permissions or propose automatic
+fixes. The policy is data, never executable code. v1.2 uses UTF-8 **JSON only** with
+no new dependency; its format version is `policy_version: 1`.
+
+### Policy format and account example
+
+```json
+{
+  "policy_version": 1,
+  "resources": [
+    {
+      "path": "/srv/payroll.db",
+      "checks": [
+        {
+          "mode": "r",
+          "accounts": {
+            "allow": ["backup"],
+            "deny": ["www-data"],
+            "deny_others": true
+          }
+        },
+        {
+          "mode": "w",
+          "accounts": {"allow": ["payroll-service"]}
+        }
+      ]
+    }
+  ]
+}
+```
+
+Each resource has an absolute Linux `path` and a nonempty list of `checks`. Each
+check has an explicit single mode (`r`, `w` or `x`) and at least one domain:
+`accounts` and/or `processes`. Domains contain optional `allow`/`deny` lists and
+an optional boolean `deny_others` (default false). A domain must declare at least
+one subject or set `deny_others: true`; empty policies cannot succeed vacuously.
+
+Account entries are nonempty account-name strings without whitespace or control
+characters. A numeric string is a username, never an implicit UID. Process entries
+are integer PIDs from 1 through 2147483647; strings, booleans and floats are rejected.
+Account names are resolved through the existing identity resolver, including NSS
+where configured. A nonexistent declared account is a POLICY_ERROR. Existing
+permission rules for OWNER/GROUP/OTHER, supplementary groups, ACL masks and
+privileged account root are unchanged.
+
+Unknown keys, duplicate JSON keys, duplicate subjects, allow/deny contradictions,
+unsupported versions and malformed structures are rejected before any evaluation.
+Each exact path appears once, and each resource/mode appears once: combine the
+domains into that check. Different spellings of a path are not canonicalized;
+`/blocked/../file` still undergoes the engine's real traversal checks. Paths must
+be absolute, NUL-free and representable as Linux filenames. No wildcard expansion
+or shell interpolation occurs.
+
+### Explicit process example
+
+```json
+{
+  "policy_version": 1,
+  "resources": [
+    {
+      "path": "/srv/private/secrets.db",
+      "checks": [
+        {
+          "mode": "r",
+          "processes": {"allow": [812], "deny": [1033]}
+        }
+      ]
+    }
+  ]
+}
+```
+
+Process checks reuse live filesystem IDs/groups, v0.9 namespace mappings and
+v0.8 capability semantics. A capability-based permit can therefore be unexpected
+access, while a read-only mount can still cause missing expected write access.
+Foreign mount/root ambiguity and uncertain capability scope remain INDETERMINATE.
+The underlying process/audit observation, including start time and available
+namespace/capability metadata, is retained in JSON and verbose output.
+
+**PIDs are fragile identities:** this policy refers to the process currently
+occupying a PID, not a persistent service or the process the author saw yesterday.
+Existing start-time/credential revalidation detects many changes during each
+evaluation; no start-time pin is supported in the policy itself. Processes can
+change between resources or modes. An exited, reused, absent or inaccessible PID
+is never interpreted as DENIED just to satisfy a deny rule.
+
+### Domain-scoped deny_others
+
+`accounts.deny_others: true` audits explicit local `/etc/passwd` accounts using
+the existing account audit. Every discovered name outside the declared allow/deny
+lists receives expected DENY. Declared accounts outside this local inventory are
+still resolved/evaluated individually. An NSS provider may resolve an explicit
+account, but this option does not enumerate every remote/directory-service user.
+
+`processes.deny_others: true` uses the existing visible `/proc` process audit.
+Every extra PID receives expected DENY. Hidden PIDs cannot be discovered; procfs,
+Yama and namespace restrictions can also prevent inspection of visible processes.
+A complete result is therefore scoped to the visible inventory, not every process
+on a physical host.
+
+Domains are independent: an account-only policy never enumerates processes, and a
+process-only policy never enumerates accounts. `allow: []` with `deny_others: true`
+means deny every discoverable subject in that domain. Explicit subjects already
+present in an audit reuse that observation rather than receiving a second,
+potentially inconsistent check. Results are not cached across resources or modes.
+Inventory failure creates an explicit scope uncertainty rather than an empty MATCH.
+
+### Comparisons, explanations and exit codes
+
+| Drift category | Intended versus observed |
+| --- | --- |
+| MATCH | ALLOW + PERMITTED, or DENY + DENIED |
+| UNEXPECTED_ACCESS | DENY + PERMITTED |
+| MISSING_ACCESS | ALLOW + DENIED |
+| INDETERMINATE | Effective access, process identity or required inventory could not be established |
+| POLICY_ERROR | Invalid policy, nonexistent declared account, or unresolved required resource |
+
+These judgments come from the supplied policy, not assumptions about what access
+is appropriate. A permit through a different mechanism is still MATCH when access
+was allowed; v1.2 reports the observed mechanism but does not invent mechanism drift.
+
+Illustrative shortened output:
+
+```text
+PERMISSION HELL v1.2 | POLICY CHECK
+Policy: 'policy.json'
+
+'/srv/payroll.db' | READ
+  MATCH
+    account: 'backup' | expected: ALLOW | actual: PERMITTED
+      via ACL named user at '/srv/payroll.db'
+  UNEXPECTED_ACCESS
+    account: 'www-data' | expected: DENY | actual: PERMITTED
+      via GROUP (supplementary GID 200 'payroll') at '/srv/payroll.db'
+  MISSING_ACCESS
+    account: 'payroll-service' | expected: ALLOW | actual: DENIED
+      blocker: '/srv' (traversal)
+      Missing directory execute/search permission.
+  INDETERMINATE
+    process: PID 4412 'container-worker' | expected: ALLOW | actual: INDETERMINATE
+      Foreign mount namespace; target identity unresolved.
+```
+
+A process deny rule can produce `UNEXPECTED_ACCESS` with
+`via CAP_DAC_READ_SEARCH at '/srv/private/secrets.db'`. Capability-dependent parent
+traversal is also reported, even when target access itself uses ordinary DAC.
+Default output shows mechanisms/blockers and uncertainty reasons without full
+diagnostics. Extra subjects that match DENY are summarized with a count/sample;
+explicit matches, drift and uncertainty remain individual. `--verbose` expands
+every comparison and includes the complete structured effective observation.
+It does **not** collect process command lines.
+
+| Exit code | Policy-check meaning |
+| --- | --- |
+| 0 | Evaluation complete within declared inventory scope; no drift |
+| 1 | Evaluation complete; unexpected or missing access found |
+| 2 | Invalid policy/input, unresolvable declared account or unresolved required resource |
+| 3 | Diagnostic/system uncertainty prevents complete comparison |
+
+Priority is **2, then 3, then 1, then 0** when results are mixed. Known comparisons
+remain available even when another resource/subject fails. Format validation is
+all-or-nothing before evaluation; runtime errors do not abort unrelated checks.
+Unlike a plain process audit, even a confirmed transient exited process makes the
+policy comparison incomplete (3): its expected access was not established.
+
+The summary contains `checks`, `matches`, `unexpected_access`, `missing_access`,
+`indeterminate`, `policy_errors`, and `extra_subjects`. Checks count individual
+comparison records, including explicit scope-failure records. Extra subjects count
+additional subject/resource/mode evaluations from deny_others, not globally unique
+identities. A document-load/validation error is a top-level error with zero evaluated
+checks. A missing resource produces error records for its declared subjects and
+any requested inventory scope.
+
+### Policy JSON output
+
+The separate schema-1 `command: "policy-check"` envelope contains `policy_version`,
+tool version, policy filename, summary, exit code, top-level errors and `resources`.
+Each resource record represents one path/mode and includes every result individually;
+no terminal grouping is applied. Existing command JSON formats are unchanged.
+
+Example result excerpt:
+
+```json
+{
+  "subject_type": "process",
+  "subject": 812,
+  "expected": "deny",
+  "actual": "permitted",
+  "drift": "unexpected_access",
+  "extra": false,
+  "mechanism": "capability",
+  "blocker": null,
+  "mechanisms": [
+    {"path": "/srv/private/secrets.db", "stage": "target", "mechanism": "capability", "capability": "CAP_DAC_READ_SEARCH"}
+  ]
+}
+```
+
+Complete results additionally include `reasons` and `effective`, containing the
+underlying account/process JSON observation where available. `mechanisms` preserves
+the evaluated inode stages, selected classes, ACL details and matched groups.
+`blocker` identifies the first known access blocker. Missing observations are null;
+`actual` preserves errors/unavailable states instead of coercing them into DENIED.
+Scope-failure records have `subject_type: "scope"`, the domain as subject and null
+expected access. Aggregate policy exit codes govern command success; nested engine
+exit codes retain their original diagnosis/audit meanings.
+
+### Policy limits, privacy and safety
+
+Group policies, process-name matching, PID/start-time pins, mechanism constraints,
+resource filtering, YAML, graph overlays and remediation suggestions are deferred.
+Only explicit usernames/PIDs and domain inventories are supported. The effective
+model's existing LSM, filesystem, namespace and race limitations remain. A policy
+check is a sequence of observations, not a transaction or kernel enforcement proof.
+
+Policy files and reports can expose sensitive paths, usernames, PIDs, groups,
+intended authorization, ACLs, namespaces and capabilities. Review them before
+sharing. The tool reads the policy file but does not read target contents,
+environment variables or process memory, and does not store reports externally.
+Configured NSS lookups retain their normal system behavior. Runtime policy checking
+never modifies target files, ACLs, ownership, groups, capabilities, namespaces,
+mounts, processes or security settings. No automatic remediation is performed.
 
 ## Visual access graphs (v1.1)
 
@@ -297,7 +530,7 @@ deferred to avoid an additional, potentially inconsistent identity snapshot.
 Illustrative shortened output (names and PIDs are examples):
 
 ```text
-PERMISSION HELL v1.1 | PROCESS AUDIT
+PERMISSION HELL v1.2 | PROCESS AUDIT
 Target: '/srv/private/secrets.db'
 Requested: READ
 
@@ -450,7 +683,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v1.1 | PROCESS DIAGNOSE
+PERMISSION HELL v1.2 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -721,7 +954,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v1.1 | AUDIT EXPLAIN
+PERMISSION HELL v1.2 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -746,7 +979,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v1.1 | AUDIT EXPLAIN
+PERMISSION HELL v1.2 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -1037,7 +1270,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v1.1 | ACCESS AUDIT
+PERMISSION HELL v1.2 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -1135,7 +1368,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v1.1 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.2 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1215,7 +1448,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v1.1 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.2 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1388,6 +1621,7 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | Namespace identity mapping | `IDMap`, `IDTranslation`, `NamespaceIdentity` in `idmap.py` |
 | Process inventory and access audit | `audit_processes()` / `ProcessAuditResult`, `ProcessAuditEntry`, `ProcessAuditSummary` in `process_audit.py` |
 | Access graph model and exports | `AccessGraph`, `GraphNode`, `GraphEdge`, graph builders and terminal/JSON/DOT serializers in `access_graph.py` |
+| Intended policy and drift | Policy parsing, `evaluate_policy()`, `DriftResult` and `DriftSummary` in `policy_drift.py` |
 | Permission engine | `evaluate_permission()` / `PermissionDecision` |
 | ACL inspection and selection | `read_access_acl()`, `evaluate_acl()` / `AccessACL`, `ACLMatch` |
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
@@ -1432,6 +1666,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Audit account filtering.
 - Process-audit UID/name filtering with explicit snapshot semantics.
 - Process-audit summary graphs and optional interactive graph views.
+- Explicit mechanism constraints, process identity pins and policy graph overlays.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Establishing capability scope in foreign user namespaces.

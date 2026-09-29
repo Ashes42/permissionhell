@@ -340,7 +340,7 @@ class PresentationTests(unittest.TestCase):
             code = ph.main(["audit-processes", "/data/file", "--pid", "42", "--pid", "43", "--json"])
         self.assertEqual(code, 0)
         self.assertEqual(runner.call_args.kwargs["pids"], [42, 43])
-        self.assertEqual(json.loads(output.getvalue())["tool"]["version"], "1.1.0")
+        self.assertEqual(json.loads(output.getvalue())["tool"]["version"], "1.2.0")
 
     def test_cli_rejects_bad_pid(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:

@@ -20,7 +20,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 
 def display_version() -> str:
@@ -1415,10 +1415,21 @@ def main(argv: list[str] | None = None) -> int:
     exports.add_argument("--json", action="store_true", help="Emit graph schema 1 with every node and edge")
     exports.add_argument("--dot", action="store_true", help="Emit Graphviz DOT without running Graphviz")
     graph_parser.add_argument("--verbose", action="store_true", help="Expand traversal and show collected graph metadata")
+    policy_parser = commands.add_parser("policy-check", help="Compare JSON policy intentions with modeled access",
+                                        epilog="Explicit account/PID scopes; no permission changes or automatic remediation.")
+    policy_parser.add_argument("policy_file")
+    policy_parser.add_argument("--json", action="store_true", help="Emit every comparison and underlying observation as schema 1 JSON")
+    policy_parser.add_argument("--verbose", action="store_true", help="Show all comparisons and complete effective-access observations")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
     def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
+        if args.command == "policy-check":
+            import policy_drift
+            report = policy_drift.DriftReport(args.policy_file, errors=[{
+                "drift": "policy_error" if code == ExitCode.INPUT else "indeterminate", "message": message}])
+            emit_policy(report)
+            return
         if args.command == "graph":
             import access_graph
             document = json_output.error_document(__version__, "graph", "graph", args.target_path,
@@ -1449,10 +1460,21 @@ def main(argv: list[str] | None = None) -> int:
             print(access_graph.serialize_graph_dot(graph), end="")
         else:
             print(access_graph.render_terminal_graph(graph, verbose=args.verbose))
+    def emit_policy(report) -> None:
+        import policy_drift
+        if args.json:
+            print(json_output.render_json(policy_drift.policy_document(report, __version__)), end="")
+        else:
+            print(policy_drift.render_policy(report, __version__, verbose=args.verbose))
     if not sys.platform.startswith("linux"):
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command == "policy-check":
+            import policy_drift
+            report = policy_drift.check_policy_file(args.policy_file, engine=sys.modules[__name__])
+            emit_policy(report)
+            return report.code
         if args.command == "graph":
             import access_graph
             if args.pid is not None:
