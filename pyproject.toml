@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "permissionhell"
+version = "0.1.0"
+description = "A read-only Linux effective-access debugger for Unix DAC and mount restrictions"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+permissionhell = "permissionhell:main"
+
+[tool.setuptools]
+py-modules = ["permissionhell"]
