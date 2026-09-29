@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.2 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
+**v0.3 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
 access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
@@ -41,12 +41,20 @@ standard library. Unsupported operating systems report a clear error, while
 
 ```bash
 python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}] [--verbose]
+python3 permissionhell.py audit TARGET_PATH [--mode {r,w,x}] [--verbose]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
 python3 permissionhell.py diagnose /opt/scripts/backup.sh --as backup --mode x
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --verbose
+python3 permissionhell.py audit /srv/music/song.flac
+python3 permissionhell.py audit /srv/customer-data/report.csv --mode w
+python3 permissionhell.py audit /srv/customer-data/report.csv --verbose
 ```
+
+`diagnose` asks whether **one named account** can access the path and explains
+each step. `audit` asks **which local accounts** can access it, with compact
+per-account explanations and permitted/denied/error totals. Both default to read.
 
 Default output leads with the verdict and its reason, then shows compact PASS/FAIL
 search checks, target metadata, and a single mount summary. `BLOCKED HERE` marks
@@ -71,13 +79,137 @@ a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
 
+## Local-account access audits
+
+```bash
+permissionhell audit /srv/customer-data/report.csv --mode r
+```
+
+Audit calls the same structured `diagnose()` engine for each account. It includes
+parent search, exclusive DAC classes, supplementary groups, access ACLs and masks,
+symlinks, the documented root model, and mount restrictions. It never shells out
+to repeated CLI invocations. Each `AccountAudit` retains its complete `Diagnosis`
+for future JSON, visualization, or per-account explanation features.
+
+**Local account** means an explicit record in the debugger's `/etc/passwd`.
+The inventory includes UID 0, service/system accounts, locked accounts, and
+accounts with `nologin` shells. There is no UID cutoff. Distinct names sharing a
+UID are evaluated separately because their configured supplementary groups may
+differ. Comments and NIS `+`/`-` compatibility directives are not account records.
+Malformed records and duplicate names produce an inventory error rather than
+silently omitting identities.
+
+The inventory deliberately avoids `pwd.getpwall()`, whose system-wide enumeration
+can include remote NSS identities. Each local name is resolved using the existing
+`pwd.getpwnam()` and `os.getgrouplist()` path, preserving diagnose semantics. Its
+resolved name/UID/primary GID must agree with the local record; mismatches become
+per-account errors. These individual lookups can still consult configured NSS
+providers. LDAP/AD/NIS-only and dynamically supplied accounts absent from
+`/etc/passwd` are not audited. Account authentication or login ability is not
+tested: a service account can access files without interactive login.
+
+Illustrative output for a three-account inventory:
+
+```text
+PERMISSION HELL v0.3 | ACCESS AUDIT
+Target: '/srv/customer-data/report.csv'
+Requested: READ (r)
+Local accounts: /etc/passwd (including service accounts)
+
+2 accounts permitted | 1 account denied | 0 account errors
+Permitted means parent search, target access, and mount checks passed.
+
+PERMITTED
+  alice (UID 1001)
+    Access via OWNER; effective: rw-.
+  root (UID 0)
+    Access via ROOT OVERRIDE [ordinary OTHER ---]; assumes traditional privileged UID 0.
+
+DENIED
+  visitor (UID 1003)
+    BLOCKED at '/srv/customer-data/report.csv': missing READ.
+    OTHER --- (neither owner nor in the owning group).
+
+Modeled DAC + ACL + mount access, not intended authorization policy.
+```
+
+Group explanations distinguish primary from supplementary membership. ACL
+explanations identify selected entries, group unions, masks, and effective bits.
+ACL-dependent parent search is shown where relevant. Mount denials identify the
+mount restriction; traversal denials identify the first blocked directory. For
+symlink/relative paths the observed resolved target is also shown. Ordinary
+successful parent checks are not repeated for every account. Use the existing
+`diagnose TARGET --as USER --verbose` command for the complete individual trace.
+
+Default audit output compresses the dominant repeated **ordinary OTHER** result
+in each section when at least three accounts share it. Grouping requires matching
+traversal, inode/ACL observations, resolved paths, mount information, and reasons;
+identical-looking short labels alone are insufficient. OWNER, ROOT, group access
+(including supplementary groups), matched named ACLs, mount restrictions, and
+errors stay individual. Less-common blockers and materially different paths also
+remain individual. Counts always count accounts, not display groups.
+
+A compressed entry looks like:
+
+```text
+  25 accounts with the same result (sample: daemon, backup, bin; +22 more)
+    Access via OTHER; effective: r--.
+```
+
+`audit TARGET --verbose` expands the full per-account summary list. It does not
+change evaluation, counts, or exit codes. Use `diagnose ... --verbose` when you
+also want every detailed traversal/ACL check for one account.
+
+### Audit failures and exit codes
+
+Audit first checks that the debugger can resolve and inspect the target's
+metadata, without testing the debugger's own read/write/execute rights. This
+prevents an absent or broken target from being concealed by early traversal
+denials for every account. It then evaluates each subject's traversal normally;
+the preflight check grants no subject access and never opens target contents.
+
+| Code | Audit meaning |
+| --- | --- |
+| 0 | Every enumerated account has a definitive modeled permitted/denied result; denials are normal data |
+| 2 | Invalid arguments or unresolved/invalid path, including a path becoming unresolved during evaluation |
+| 3 | Inventory/preflight failure, empty inventory, or any per-account diagnostic error; partial results are retained |
+
+Audit does **not** return 1 merely because access is denied. A group lookup or
+required ACL/metadata inspection failure goes into **ERRORS / UNKNOWN**, never
+PERMITTED or DENIED, and evaluation continues for other accounts. If a target
+disappears mid-audit, completed results are retained with exit 2. The existing
+engine can establish a definite DAC denial despite failed mount inspection;
+such results remain denials and the mount failure is reported as an inspection
+note. Exit 0 then means every account's access result is known, not that every
+inspection layer was available.
+
+### Audit limitations and privacy
+
+This reports **effective modeled access, not intended authorization policy**.
+OTHER or supplementary-group access is factual; the tool does not label it
+unexpected or illegitimate. It does not enumerate processes, impersonate users,
+inspect password hashes in `/etc/shadow`, or evaluate authentication policy.
+
+Reports can reveal account names/UIDs, group relationships, paths, and ACL access
+patterns. Review output before sharing it. Only names/UIDs/primary GIDs are retained
+from `/etc/passwd`; password, GECOS, home-directory, and shell fields are not stored
+in results or printed. The application sends no audit report to external services;
+normal system NSS lookups may contact providers configured on the host.
+
+An audit shares one lazily read mount-table snapshot (or its inspection error).
+Other inode/ACL observations and identity lookups remain per-account. The
+`AuditContext` can accommodate more shared metadata readers later without caching
+subject-specific decisions. This is a sequential observation, not an atomic
+security snapshot: account, group, path, ACL, or mount changes can invalidate it.
+All existing security-layer and namespace limitations below still apply.
+
 ## Example output
 
 Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.2 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.3 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -157,7 +289,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.2 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.3 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -240,7 +372,7 @@ inspection fails, and the mount error is shown separately.
 
 ### Root
 
-v0.2 preserves the **traditional privileged root** model for UID 0:
+v0.3 preserves the **traditional privileged root** model for UID 0:
 read/write and directory search bypass ordinary mode bits and POSIX access ACLs.
 For execution of a non-directory inode, at least one OWNER, GROUP, or OTHER
 execute bit must be present. Mount `ro` and `noexec` restrictions still apply.
@@ -273,11 +405,12 @@ flags are not modeled.
 
 ## Exit codes
 
-Definitions are centralized in `ExitCode` in `permissionhell.py`.
+Definitions are centralized in `ExitCode` in `permissionhell.py`. The following
+table describes **diagnose**, unchanged from v0.2; audit semantics are above.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Requested access permitted by the v0.2 model |
+| 0 | Requested access permitted by the v0.3 model |
 | 1 | Requested access denied by a modeled check |
 | 2 | Invalid CLI/input: malformed arguments, unknown user, missing component, broken/looping link, non-directory component |
 | 3 | Diagnostic/system error: inaccessible metadata, required ACL inspection failed, unavailable mount information without an established denial, unsupported platform |
@@ -330,7 +463,10 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
 | Mount inspection | `read_mounts()`, `find_mount()` / `Mount` |
 | Verdict | `diagnose()`, `determine_verdict()` / `Diagnosis` |
+| Local inventory | `enumerate_local_accounts()` / `LocalAccount` |
+| Audit | `audit_target()` / `AuditReport`, `AccountAudit`, `AuditContext` |
 | Presentation | `render_report(report, verbose=False)`, `render_verbose_report()` |
+| Audit presentation | `render_audit()` |
 
 The engine returns dataclasses; only the renderer formats terminal output.
 
@@ -346,7 +482,7 @@ a temporary file and relative symlink, the current account, real mountinfo, and 
 CLI subprocess. Tests never change system users or mounts.
 Rendering tests cover concise and verbose output, blocker explanations, root
 labels, symlink display, scope visibility, CLI flag routing, and unchanged exit
-codes. All original **60** semantic/CLI/rendering tests remain unchanged.
+codes. All original **119** v0.2 semantic/CLI/rendering/ACL tests remain unchanged.
 
 ACL tests cover parsing failures, exclusive selection, masks, supplementary
 groups, group unions, traversal, root/owner shortcuts, and rendering. Linux
@@ -355,9 +491,15 @@ directories**, exercise symlinks and default/access ACL separation, and clean up
 afterward. No root privileges are required. The integration tests skip when the
 temporary filesystem cannot manipulate ACLs; parser and decision tests still run.
 
+Audit tests mock local inventory and exercise the existing engine across multiple
+subjects. They cover counts, access mechanisms, shared mount reads, per-account
+errors, invalid paths, and exit codes. Additional Linux integration tests audit
+real local accounts against temporary files/symlinks, without requiring root.
+
 ## Roadmap
 
 - JSON output backed by the existing structured results.
+- Audit account filtering and `--explain USER` using retained diagnoses.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Process-aware credentials, capability sets, and mount namespaces.

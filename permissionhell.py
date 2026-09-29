@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Permission Hell v0.2: read-only Linux DAC, POSIX ACL, and mount diagnostics."""
+"""Permission Hell v0.3: read-only Linux access diagnosis and local-account audits."""
 
 from __future__ import annotations
 
 import argparse
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import IntEnum
+import errno
 import os
 import re
 import stat
@@ -330,14 +332,152 @@ def determine_verdict(report: Diagnosis) -> None:
                               " and the inspected mount imposes no applicable restriction.")
 
 
-def diagnose(path: str, subject: Subject, mode: str) -> Diagnosis:
+def diagnose(path: str, subject: Subject, mode: str, *,
+             mount_reader: Callable[[], list[Mount]] | None = None) -> Diagnosis:
     report = Diagnosis(subject, path, mode, trace_path(path, subject, mode))
     if report.trace.resolved_path is not None:
         try:
-            report.mount = find_mount(report.trace.resolved_path, read_mounts())
+            report.mount = find_mount(report.trace.resolved_path, (mount_reader or read_mounts)())
         except DiagnosticError as exc:
             report.mount_error = str(exc)
     determine_verdict(report)
+    return report
+
+
+@dataclass(frozen=True)
+class LocalAccount:
+    username: str
+    uid: int
+    primary_gid: int
+
+
+def enumerate_local_accounts() -> list[LocalAccount]:
+    """Inventory explicit /etc/passwd records, not remote NSS enumeration.
+
+    Authentication fields are neither retained nor displayed. Compat +/- NIS
+    directives are not local account definitions and are deliberately ignored.
+    """
+    accounts = []
+    names = set()
+    try:
+        with open("/etc/passwd", encoding="utf-8", errors="surrogateescape") as source:
+            for line_number, raw in enumerate(source, 1):
+                line = raw.rstrip("\n")
+                if not line.strip() or line.lstrip().startswith("#") or line.startswith(("+", "-")):
+                    continue
+                fields = line.split(":")
+                if (len(fields) != 7 or not fields[0] or "\x00" in line
+                        or not re.fullmatch(r"[0-9]+", fields[2])
+                        or not re.fullmatch(r"[0-9]+", fields[3])):
+                    raise DiagnosticError(f"Malformed local account record at /etc/passwd:{line_number}.")
+                numeric = [value.lstrip("0") or "0" for value in fields[2:4]]
+                if any(len(value) > 10 for value in numeric):
+                    raise DiagnosticError(f"Invalid UID/GID at /etc/passwd:{line_number}.")
+                uid, gid = map(int, numeric)
+                if uid >= 0xFFFFFFFF or gid >= 0xFFFFFFFF:
+                    raise DiagnosticError(f"Invalid UID/GID at /etc/passwd:{line_number}.")
+                if fields[0] in names:
+                    raise DiagnosticError(f"Duplicate local username at /etc/passwd:{line_number}.")
+                names.add(fields[0])
+                accounts.append(LocalAccount(fields[0], uid, gid))
+    except OSError as exc:
+        raise DiagnosticError(f"Cannot enumerate local accounts from /etc/passwd: {exc}") from exc
+    return sorted(accounts, key=lambda account: account.username)
+
+
+@dataclass
+class AccountAudit:
+    account: LocalAccount
+    diagnosis: Diagnosis | None = None
+    error: str | None = None
+
+
+@dataclass
+class AuditReport:
+    requested_path: str
+    mode: str
+    permitted: list[AccountAudit] = field(default_factory=list)
+    denied: list[AccountAudit] = field(default_factory=list)
+    errors: list[AccountAudit] = field(default_factory=list)
+    failure: str | None = None
+    code: ExitCode = ExitCode.ALLOWED
+
+
+@dataclass
+class AuditContext:
+    """One audit's shared inspection context; never cache subject decisions."""
+    mounts: list[Mount] | None = None
+    mount_error: DiagnosticError | None = None
+
+    def read_mounts(self) -> list[Mount]:
+        if self.mount_error is not None:
+            raise self.mount_error
+        if self.mounts is None:
+            try:
+                self.mounts = read_mounts()
+            except DiagnosticError as exc:
+                self.mount_error = exc
+                raise
+        return self.mounts
+
+
+def inspect_audit_target(path: str) -> None:
+    """Check existence as the debugger, not subject access; preserve the raw path.
+
+    Otherwise all subjects could fail early traversal and conceal a missing or
+    broken target. Every account still undergoes the normal subject traversal.
+    """
+    if not path or "\x00" in path:
+        raise DiagnosticError("Target path is empty or contains a NUL byte.", ExitCode.INPUT)
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError) as exc:
+        raise DiagnosticError(f"Unresolved target {path!r} (missing component, broken link, or non-directory): {exc}",
+                              ExitCode.INPUT) from exc
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise DiagnosticError(f"Unresolved target {path!r}: too many symbolic links.", ExitCode.INPUT) from exc
+        raise DiagnosticError(f"Debugger cannot inspect audit target {path!r}: {exc}") from exc
+
+
+def audit_target(path: str, mode: str = "r") -> AuditReport:
+    report = AuditReport(path, mode)
+    try:
+        inspect_audit_target(path)
+        accounts = enumerate_local_accounts()
+        if not accounts:
+            raise DiagnosticError("No local accounts found in /etc/passwd; no identities were evaluated.")
+    except DiagnosticError as exc:
+        report.failure, report.code = str(exc), exc.code
+        return report
+    context = AuditContext()
+    path_error = False
+    for account in accounts:
+        try:
+            subject = resolve_subject(account.username)
+            if (subject.username, subject.uid, subject.primary_gid) != (
+                    account.username, account.uid, account.primary_gid):
+                raise DiagnosticError("System identity lookup disagrees with the local account record;"
+                                      " account may have changed or an NSS identity may shadow it.")
+            diagnosis = diagnose(path, subject, mode, mount_reader=context.read_mounts)
+        except (DiagnosticError, OSError) as exc:
+            report.errors.append(AccountAudit(account, error=str(exc)))
+            continue
+        result = AccountAudit(account, diagnosis=diagnosis)
+        if diagnosis.code == ExitCode.ALLOWED:
+            report.permitted.append(result)
+        elif diagnosis.code == ExitCode.DENIED:
+            report.denied.append(result)
+        else:
+            # Unknown identity/ACL/metadata states are never counted as denials.
+            result.error = diagnosis.trace.failure or "; ".join(diagnosis.reasons)
+            report.errors.append(result)
+            path_error |= diagnosis.code == ExitCode.INPUT
+    if path_error:
+        report.code = ExitCode.INPUT
+        report.failure = "Path resolution failed during the audit; the filesystem may have changed."
+    elif report.errors:
+        report.code = ExitCode.ERROR  # Partial results remain useful, but completion is not success.
     return report
 
 
@@ -471,7 +611,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
     path = repr(report.requested_path)
     if report.trace.resolved_path is not None and report.trace.resolved_path != report.requested_path:
         path += f" -> {report.trace.resolved_path!r}"
-    lines = [f"PERMISSION HELL v0.2 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
+    lines = [f"PERMISSION HELL v0.3 | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
              f"Target: {path}", "", f"{verdict_label(report)} (DAC + ACL + mount model)",
              *concise_reasons(report)]
     if subject.uid == 0:
@@ -525,7 +665,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
 
 def render_verbose_report(report: Diagnosis) -> str:
     subject = report.subject
-    lines = ["PERMISSION HELL v0.2", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
+    lines = ["PERMISSION HELL v0.3", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
              "SUBJECT", f"User: {subject.username} (UID {subject.uid})",
              f"Primary group: {subject.primary_group} (GID {subject.primary_gid})",
              "Supplementary groups: " + (", ".join(f"{name} ({gid})" for name, gid in
@@ -566,13 +706,184 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"Status: {'READ-ONLY' if mount.readonly else 'READ-WRITE'}"])
     else:
         lines.append(report.mount_error or "Not evaluated: target path was not resolved.")
-    lines.extend(["", verdict_label(report) + " (v0.2 DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
+    lines.extend(["", verdict_label(report) + " (v0.3 DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
+    return "\n".join(lines)
+
+
+def audit_access_reason(inode: Inode, subject: Subject) -> str:
+    if subject.uid == 0:
+        return f"Access via {access_summary(inode, subject)}; assumes traditional privileged UID 0."
+    if acl_relevant(inode):
+        reason = acl_explanation(inode)
+        supplementary = sorted({inode.gid if entry.tag == Tag.GROUP_OBJ else entry.qualifier
+                                for entry in inode.acl_match.entries
+                                if entry.tag in (Tag.GROUP_OBJ, Tag.GROUP)} & set(subject.supplementary_gids))
+        if supplementary:
+            reason += " Matching supplementary GIDs: " + ", ".join(map(str, supplementary)) + "."
+        return reason
+    selected = inode.decision.permission_class
+    if selected == "GROUP":
+        kind = "primary" if inode.gid == subject.primary_gid else "supplementary"
+        return (f"Access via GROUP ({kind} group {inode.group}, GID {inode.gid});"
+                f" effective: {bits(inode.decision.available)}.")
+    return f"Access via {selected}; effective: {bits(inode.decision.available)}."
+
+
+def audit_denial_reason(inode: Inode, subject: Subject) -> str:
+    if subject.uid == 0 or acl_relevant(inode):
+        return denial_explanation(inode, subject)
+    selected = inode.decision.permission_class
+    why = {"OWNER": f"matches owner UID {inode.uid}",
+           "GROUP": f"matches owning GID {inode.gid}",
+           "OTHER": "neither owner nor in the owning group"}[selected]
+    return f"{selected} {bits(inode.decision.available)} ({why})."
+
+
+def audit_account_lines(result: AccountAudit) -> list[str]:
+    diagnosis = result.diagnosis
+    if result.error is not None:
+        lines = [result.error]
+        if diagnosis and diagnosis.mount_error:
+            lines.append(diagnosis.mount_error)
+        return lines
+    subject, target = diagnosis.subject, diagnosis.trace.target
+    if diagnosis.code == ExitCode.ALLOWED:
+        lines = [audit_access_reason(target, subject)]
+        # Surface ACL-dependent parent search without repeating every ordinary
+        # successful path component. The structured result retains the full trace.
+        seen = set()
+        for event in diagnosis.trace.events:
+            if isinstance(event, Inode) and event not in seen:
+                seen.add(event)
+                if acl_relevant(event):
+                    lines.append(f"Search at {event.path!r}: {audit_access_reason(event, subject)}")
+                elif event.decision.root_override:
+                    lines.append(f"Search at {event.path!r}: ROOT OVERRIDE.")
+        return lines
+    if diagnosis.trace.failure:
+        blocked = next((event for event in diagnosis.trace.events
+                        if isinstance(event, Inode) and not event.decision.allowed), None)
+        if blocked:
+            return [f"BLOCKED at {blocked.path!r}: missing EXECUTE/SEARCH.",
+                    audit_denial_reason(blocked, subject)]
+        return [diagnosis.trace.failure]
+    lines = []
+    if not target.decision.allowed:
+        lines.extend([f"BLOCKED at {target.path!r}: missing {OPERATIONS[diagnosis.mode][1]}.",
+                      audit_denial_reason(target, subject)])
+        # The engine lists the target denial and detailed DAC reason first.
+        mount_reasons = diagnosis.reasons[2:]
+    else:
+        mount_reasons = diagnosis.reasons
+    lines.extend(f"BLOCKED by mount: {reason}" for reason in mount_reasons)
+    return lines
+
+
+def audit_group_key(result: AccountAudit) -> tuple | None:
+    """Conservative display equivalence, never an access decision.
+
+    Only ordinary OTHER paths are candidates. Comparing complete observations
+    avoids hiding differences in traversal, ACLs, resolved paths, or mounts just
+    because their short explanations happen to look alike.
+    """
+    diagnosis = result.diagnosis
+    if (result.error is not None or diagnosis is None or diagnosis.subject.uid == 0
+            or diagnosis.code not in (ExitCode.ALLOWED, ExitCode.DENIED) or diagnosis.mount_error):
+        return None
+    trace = diagnosis.trace
+    inodes = [event for event in trace.events if isinstance(event, Inode)]
+    if trace.target is not None:
+        inodes.append(trace.target)
+    if not inodes or any(inode.decision.permission_class != "OTHER"
+                         or inode.decision.root_override or acl_relevant(inode) for inode in inodes):
+        return None
+    if diagnosis.code == ExitCode.DENIED:
+        if trace.failure:
+            if not any(not inode.decision.allowed for inode in inodes):
+                return None
+        elif (trace.target is None or trace.target.decision.allowed or len(diagnosis.reasons) != 2):
+            # Keep mount denials (including an additional mount restriction
+            # after target denial) individual. The engine retains both reasons.
+            return None
+    return (diagnosis.code, diagnosis.mode, diagnosis.requested_path, tuple(trace.events),
+            trace.target, trace.resolved_path, trace.failure, diagnosis.mount,
+            tuple(audit_account_lines(result)))
+
+
+def audit_display_groups(accounts: list[AccountAudit], verbose: bool = False) -> list[list[AccountAudit]]:
+    if verbose:
+        return [[result] for result in accounts]
+    keys = [audit_group_key(result) for result in accounts]
+    buckets = {}
+    for result, key in zip(accounts, keys):
+        if key is not None:
+            buckets.setdefault(key, []).append(result)
+    if not buckets:
+        return [[result] for result in accounts]
+    bulk_key = max(buckets, key=lambda key: len(buckets[key]))
+    if len(buckets[bulk_key]) < 3:
+        return [[result] for result in accounts]
+    # Collapse only the dominant repeated result in this section. Less-common
+    # failure locations and materially different paths stay individually visible.
+    groups = []
+    emitted = False
+    for result, key in zip(accounts, keys):
+        if key == bulk_key:
+            if not emitted:
+                groups.append(buckets[bulk_key])
+                emitted = True
+        else:
+            groups.append([result])
+    return groups
+
+
+def render_audit(report: AuditReport, verbose: bool = False) -> str:
+    operation = OPERATIONS[report.mode][1]
+    lines = ["PERMISSION HELL v0.3 | ACCESS AUDIT", f"Target: {report.requested_path!r}",
+             f"Requested: {operation} ({report.mode})", "Local accounts: /etc/passwd (including service accounts)", ""]
+    resolved = sorted({result.diagnosis.trace.resolved_path
+                       for result in report.permitted + report.denied + report.errors
+                       if result.diagnosis and result.diagnosis.trace.resolved_path is not None})
+    if resolved and resolved != [report.requested_path]:
+        lines.extend(["Resolved target(s): " + ", ".join(repr(path) for path in resolved), ""])
+    if report.failure:
+        label = "INVALID INPUT / UNRESOLVED PATH" if report.code == ExitCode.INPUT else "AUDIT INCOMPLETE"
+        lines.extend([label, report.failure, ""])
+    elif report.errors:
+        lines.extend(["AUDIT INCOMPLETE: some accounts could not be evaluated.", ""])
+    permitted, denied, errors = len(report.permitted), len(report.denied), len(report.errors)
+    lines.extend([f"{permitted} account{'s' if permitted != 1 else ''} permitted"
+                  f" | {denied} account{'s' if denied != 1 else ''} denied"
+                  f" | {errors} account error{'s' if errors != 1 else ''}",
+                  "Permitted means parent search, target access, and mount checks passed."])
+    compressed = False
+    for title, accounts in (("PERMITTED", report.permitted), ("DENIED", report.denied), ("ERRORS / UNKNOWN", report.errors)):
+        if not accounts:
+            continue
+        lines.extend(["", title])
+        for group in audit_display_groups(accounts, verbose=verbose):
+            result = group[0]
+            if len(group) == 1:
+                lines.append(f"  {result.account.username} (UID {result.account.uid})")
+            else:
+                compressed = True
+                sample = ", ".join(entry.account.username for entry in group[:3])
+                more = f"; +{len(group) - 3} more" if len(group) > 3 else ""
+                lines.append(f"  {len(group)} accounts with the same result (sample: {sample}{more})")
+            lines.extend(f"    {line}" for line in audit_account_lines(result))
+    if compressed:
+        lines.append("\nGrouped identical OTHER results; use --verbose for the full account list.")
+    # A known DAC denial can be definitive even if mount inspection failed.
+    mount_notes = sorted({result.diagnosis.mount_error for result in report.denied
+                          if result.diagnosis.mount_error})
+    lines.extend(f"\nInspection note (known denials retained): {note}" for note in mount_notes)
+    lines.extend(["", "Modeled DAC + ACL + mount access, not intended authorization policy."])
     return "\n".join(lines)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
-    parser.add_argument("--version", action="version", version="permissionhell 0.2.0")
+    parser.add_argument("--version", action="version", version="permissionhell 0.3.0")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("diagnose", help="Explain Linux DAC, ACL, and mount access decisions", epilog=SCOPE_TEXT)
     command.add_argument("target_path")
@@ -580,11 +891,20 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("--mode", choices=OPERATIONS, default="r")
     command.add_argument("--verbose", action="store_true",
                          help="Show all traversal checks, detailed reasoning, groups, mount options, and limitations")
+    audit = commands.add_parser("audit", help="Show modeled access for every explicit local /etc/passwd account",
+                                epilog="Includes service accounts; reports modeled access, not intended policy. " + SCOPE_TEXT)
+    audit.add_argument("target_path")
+    audit.add_argument("--mode", choices=OPERATIONS, default="r")
+    audit.add_argument("--verbose", action="store_true", help="Show every account individually without grouping")
     args = parser.parse_args(argv)
     if not sys.platform.startswith("linux"):
         print("permissionhell: unsupported platform; diagnosis requires Linux.", file=sys.stderr)
         return ExitCode.ERROR
     try:
+        if args.command == "audit":
+            audit_report = audit_target(args.target_path, args.mode)
+            print(render_audit(audit_report, verbose=args.verbose))
+            return audit_report.code
         subject = resolve_subject(args.username)
         report = diagnose(args.target_path, subject, args.mode)
         print(render_report(report, verbose=args.verbose))
