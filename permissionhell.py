@@ -15,7 +15,9 @@ import shlex
 import stat
 import sys
 
-__version__ = "0.5.0"
+import json_output
+
+__version__ = "0.6.0"
 
 
 def display_version() -> str:
@@ -1140,12 +1142,14 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("target_path")
     command.add_argument("--as", dest="username", required=True, help="Account to evaluate")
     command.add_argument("--mode", choices=OPERATIONS, default="r")
+    command.add_argument("--json", action="store_true", help="Emit schema-versioned JSON instead of human text")
     command.add_argument("--verbose", action="store_true",
                          help="Show all traversal checks, detailed reasoning, groups, mount options, and limitations")
     audit = commands.add_parser("audit", help="Show modeled access for every explicit local /etc/passwd account",
                                 epilog="Includes service accounts; reports modeled access, not intended policy. " + SCOPE_TEXT)
     audit.add_argument("target_path")
     audit.add_argument("--mode", choices=OPERATIONS, default="r")
+    audit.add_argument("--json", action="store_true", help="Emit all results as JSON; --verbose does not change JSON detail")
     audit.add_argument("--explain", metavar="USER", help="Explain one named account's ordered access path")
     audit.add_argument("--suggest-fixes", action="store_true", help="With --explain, show informational change alternatives; never execute them")
     audit.add_argument("--verbose", action="store_true",
@@ -1153,27 +1157,51 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
+    def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
+        if args.json:
+            username = args.username if args.command == "diagnose" else args.explain
+            mode = "explain" if args.command == "audit" and args.explain is not None else args.command
+            document = json_output.error_document(__version__, args.command, mode, args.target_path,
+                                                  args.mode, username, message, code, stage)
+            if getattr(args, "suggest_fixes", False):
+                document["remediations"] = []
+            print(json_output.render_json(document), end="")
+        else:
+            print(f"permissionhell: {message}", file=sys.stderr)
     if not sys.platform.startswith("linux"):
-        print("permissionhell: unsupported platform; diagnosis requires Linux.", file=sys.stderr)
+        emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
         if args.command == "audit":
             if args.explain is not None:
                 explanation = explain_audit_target(args.target_path, args.explain, args.mode)
-                print(render_audit_explanation(explanation, verbose=args.verbose))
-                if args.suggest_fixes:
-                    print("\n" + render_remediations(suggest_remediations(explanation.diagnosis)))
+                if args.json:
+                    suggestions = suggest_remediations(explanation.diagnosis) if args.suggest_fixes else None
+                    document = json_output.diagnosis_document(explanation.diagnosis, __version__,
+                                                              explain=True, remediations=suggestions)
+                    print(json_output.render_json(document), end="")
+                else:
+                    print(render_audit_explanation(explanation, verbose=args.verbose))
+                    if args.suggest_fixes:
+                        print("\n" + render_remediations(suggest_remediations(explanation.diagnosis)))
                 return explanation.code
             audit_report = audit_target(args.target_path, args.mode)
-            print(render_audit(audit_report, verbose=args.verbose))
+            if args.json:
+                print(json_output.render_json(json_output.audit_document(audit_report, __version__)), end="")
+            else:
+                print(render_audit(audit_report, verbose=args.verbose))
             return audit_report.code
         subject = resolve_subject(args.username)
         report = diagnose(args.target_path, subject, args.mode)
-        print(render_report(report, verbose=args.verbose))
+        if args.json:
+            print(json_output.render_json(json_output.diagnosis_document(report, __version__)), end="")
+        else:
+            print(render_report(report, verbose=args.verbose))
         return report.code
     except (DiagnosticError, OSError) as exc:
-        print(f"permissionhell: {exc}", file=sys.stderr)
-        return exc.code if isinstance(exc, DiagnosticError) else ExitCode.ERROR
+        code = exc.code if isinstance(exc, DiagnosticError) else ExitCode.ERROR
+        emit_error(str(exc), code)
+        return code
 
 
 if __name__ == "__main__":

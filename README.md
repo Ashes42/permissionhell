@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.5 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
+**v0.6 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
 access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
@@ -105,7 +105,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.5 | AUDIT EXPLAIN
+PERMISSION HELL v0.6 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -130,7 +130,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.5 | AUDIT EXPLAIN
+PERMISSION HELL v0.6 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -163,9 +163,9 @@ input/path and 3 for incomplete inspection. A known denial remains definitive
 even when mount inspection is unavailable, with that limitation shown.
 
 The canonical version is `permissionhell.__version__`. Package metadata and
-`--version` use its full value (**0.5.0**); all report headings derive their compact
-label (**v0.5**) from it. Nonzero patch versions remain visible (for example,
-`0.5.1` displays as `v0.5.1`). The permission model is unchanged.
+`--version` use its full value (**0.6.0**); all report headings derive their compact
+label (**v0.6**) from it. Nonzero patch versions remain visible (for example,
+`0.6.1` displays as `v0.6.1`). The permission model is unchanged.
 
 ## Informational change suggestions (v0.5)
 
@@ -251,8 +251,143 @@ unchanged identity/metadata state must be verified before manually applying ACLs
 
 `RemediationSuggestion` holds category, title, commands, effect, and caveats.
 `suggest_remediations()` consumes a `Diagnosis` without mutation or extra system
-inspection; a separate renderer formats it. Package/CLI version is **0.5.0**;
+inspection; a separate renderer formats it. Package/CLI version is **0.6.0**;
 all explanation and diagnostic banners use the same canonical version source.
+
+## JSON output (v0.6, schema 1)
+
+```bash
+permissionhell diagnose /srv/data/file.db --as www-data --mode r --json
+permissionhell audit /srv/data/file.db --mode r --json
+permissionhell audit /srv/data/file.db --explain www-data --json
+permissionhell audit /srv/data/file.db --explain www-data --mode w --suggest-fixes --json
+```
+
+JSON is a public interface for scripts, CI, integrations, and a future UI.
+It serializes collected analysis results directly, without parsing human output
+or rechecking permissions. Without `--json`, human output is unchanged apart from
+the current version label. JSON always includes the full ordered observed trace
+and every evaluated audit account; text grouping never applies. `--verbose` has
+**no additional effect on JSON** and never re-enables human output.
+
+Every normal result is one pretty-printed JSON object on stdout, with indentation
+of two spaces and a trailing newline. Keys have deterministic insertion order;
+mount option sets and audit accounts are sorted. Strings use JSON escapes,
+including terminal controls and Linux surrogateescaped filename bytes. No secrets,
+password fields, or target file contents are collected or exported.
+
+Common envelope fields:
+
+| Field | Meaning |
+| --- | --- |
+| `schema_version` | String `"1"`, independent of the tool release |
+| `tool` | `{ "name": "permissionhell", "version": "0.6.0" }` |
+| `command` | `diagnose` or `audit` |
+| `mode` | `diagnose`, `audit`, or `explain` |
+| `requested_mode` | `r`, `w`, or `x` |
+| `target_path` | Original target, without normalizing away traversal |
+| `verdict`, `exit_code` | Mode-specific result and actual process exit code |
+| `errors` | Objects with `kind`, `stage`, and diagnostic `message` |
+
+For diagnose/explain, `subject` contains username, UID, primary GID/group, and
+`supplementary_groups` objects containing names and GIDs. `resolved_target_path`
+is null until available. `access_path` retains ordered parent inode observations
+and symlinks, including repeated checks after symlink restarts. Inode observations
+carry `stage`, `path`, `inode_type`, `result`, `blocker`, `required_permission`,
+`mechanism`, `permission_class`, `effective_permissions`, owner/group, mode,
+matched groups, root details, ACL details, and the engine's reason.
+The final `target_inode` is separate from the parent traversal array.
+Symlink observations contain `kind: "symlink"`, `path`, and raw `destination`;
+relative destinations are interpreted by the engine, not rewritten in the JSON.
+
+Permission objects have integer `bits` (0–7) and `symbolic` (`rwx`) fields. Mode
+objects have integer bits, an octal string, and the full symbolic file mode.
+`mechanism` is `unix_dac`, `posix_acl`, or `root`. With root override, the permission
+bits are the selected ordinary class's bits; `root_override` and `result` express
+the override, rather than inventing a synthetic permission mask.
+
+An extended ACL decision includes `decision_type`, matched user/group IDs, only
+the selected entries, `group_union` when applicable, specified/effective rights,
+mask, `mask_reduced_requested_rights`, and result. Unneeded/uninspected ACL data
+is null. ACL entries use lowercase Linux tag names and numeric IDs; unqualified
+owner/owning-group/other entries have null IDs. The inode owner/group identifies
+the unqualified principals. Default ACLs are outside the access model.
+
+`mount` contains point, filesystem, sorted options, read-only/noexec flags,
+decision reasons, result, and blocker flag. Results are `permitted`, `denied`,
+`unknown`, or `not_evaluated`. A mount can be observed yet unevaluated if path/ACL
+inspection failed. `first_blocker` is null or a `{stage, path, mechanism}` object
+for the first known denial; unresolved/unknown states are errors, not blockers.
+An error can coexist with a definitive denial, such as unavailable mount data
+after a known inode denial. `reasons` retains the verdict engine's explanations.
+
+Small diagnose example, selected fields only:
+
+```json
+{
+  "schema_version": "1",
+  "tool": {"name": "permissionhell", "version": "0.6.0"},
+  "command": "diagnose",
+  "mode": "diagnose",
+  "requested_mode": "r",
+  "target_path": "/srv/data/file.db",
+  "resolved_target_path": "/srv/data/file.db",
+  "verdict": "permitted",
+  "exit_code": 0,
+  "first_blocker": null,
+  "errors": []
+}
+```
+
+Normal audit adds `account_source`, `account_scope`, `totals`, and `accounts`.
+Each account contains its username/UID/primary GID, diagnosis fields, a selected
+inode `decision` summary, `mechanism`, `effective_permissions`, and `blocker_path`.
+Mount blockers use `mechanism: "mount"` at account level; the `decision` summary
+still describes the inode check. Account errors retain any partial observations.
+Unknown identities have null subject/decision fields, not fabricated permissions.
+No grouping is applied, and totals count accounts. Example with selected fields:
+
+```json
+{
+  "schema_version": "1",
+  "command": "audit",
+  "mode": "audit",
+  "account_source": "/etc/passwd",
+  "account_scope": "explicit_local_accounts_including_service_accounts",
+  "totals": {"permitted": 1, "denied": 1, "errors": 0},
+  "accounts": [
+    {"username": "alice", "uid": 1000, "verdict": "permitted", "mechanism": "unix_dac"},
+    {"username": "visitor", "uid": 1001, "verdict": "denied", "blocker_path": "/srv/data/file.db"}
+  ],
+  "verdict": "complete",
+  "exit_code": 0
+}
+```
+
+With `--suggest-fixes`, focused JSON also has `remediations`, an array of category,
+title, commands, effect, and caveats. Categories use lowercase underscores (for
+example `narrow_change` and `group_level_change`). `commands` is an array of
+shell-display strings, **never executed**. Without the flag the key is absent;
+if analysis fails before producing a diagnosis, the requested array is empty.
+
+Diagnose/explain verdicts are `permitted` (0), `denied` (1), `invalid_input` (2),
+and `error` (3). Normal audit uses `complete` (0), `invalid_input` (2), or
+`incomplete` (3); individual denials do not fail an otherwise complete audit.
+Unknown users, unresolved paths, inspection failures, and unsupported platforms
+produce structured JSON after successful argument parsing. Failures before any
+diagnosis include `requested_username`, null subject, and an error object.
+Parser failures (missing arguments, invalid choices, invalid flag combinations)
+retain argparse text on **stderr**, empty stdout, and code 2 even with `--json`.
+Explicit `--help`/`--version` retain their normal text behavior.
+
+**Privacy:** JSON exposes usernames, UIDs/GIDs, membership, paths, and matched ACL
+identities. Store and share it according to the sensitivity of that metadata.
+The existing incomplete security model and filesystem-race limitations apply.
+Schema 1 has no streaming/JSONL mode or formal JSON Schema validator; consumers
+should check `schema_version`, tolerate new fields, and use typed decision fields
+rather than parsing prose. Error messages can change, and the underlying engine
+does not currently provide separate errno or structured failing-path fields for
+all inspection failures. Null means unknown/not applicable, never zero rights.
 
 ## Local-account access audits
 
@@ -264,7 +399,7 @@ Audit calls the same structured `diagnose()` engine for each account. It include
 parent search, exclusive DAC classes, supplementary groups, access ACLs and masks,
 symlinks, the documented root model, and mount restrictions. It never shells out
 to repeated CLI invocations. Each `AccountAudit` retains its complete `Diagnosis`
-for future JSON, visualization, or per-account explanation features.
+for JSON, focused explanations, and future visualization features.
 
 **Local account** means an explicit record in the debugger's `/etc/passwd`.
 The inventory includes UID 0, service/system accounts, locked accounts, and
@@ -286,7 +421,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.5 | ACCESS AUDIT
+PERMISSION HELL v0.6 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -384,7 +519,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.5 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.6 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -464,7 +599,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.5 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.6 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -673,8 +808,8 @@ real local accounts against temporary files/symlinks, without requiring root.
 
 ## Roadmap
 
-- JSON output backed by the existing structured results.
-- Audit account filtering and `--explain USER` using retained diagnoses.
+- Formal JSON Schema validation and streaming large audit results.
+- Audit account filtering.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Process-aware credentials, capability sets, and mount namespaces.
