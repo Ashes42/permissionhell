@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.6 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
+**v0.7 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
 access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
@@ -43,6 +43,7 @@ standard library. Unsupported operating systems report a clear error, while
 python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py audit TARGET_PATH [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py audit TARGET_PATH --explain USERNAME [--mode {r,w,x}] [--verbose]
+python3 permissionhell.py process ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -80,6 +81,131 @@ a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
 
+## Running-process analysis (v0.7)
+
+```bash
+permissionhell process /srv/site/index.html --pid 1842 --mode r
+permissionhell process /srv/site/index.html --pid 1842 --verbose
+permissionhell process /srv/site/index.html --pid 1842 --json
+```
+
+The separate `process` command evaluates **one running PID**, without redefining
+account diagnose/audit or enumerating processes. It reads `/proc/PID/status`
+for real, effective, saved and filesystem IDs and the live supplementary group
+list. It does not resolve the login user and then expand account database groups.
+Names are optional labels; unknown IDs remain numeric and are not errors.
+
+Filesystem checks use **fsuid, fsgid, and the process's supplementary GIDs** through
+the existing DAC/ACL engine. Real/effective/saved IDs are reported but do not
+override filesystem IDs. If an older/incomplete status row supplies real and
+effective IDs but no filesystem ID, the effective ID is an explicitly reported
+fallback; a missing saved ID stays null. Missing real/effective IDs or Groups,
+invalid numbers, duplicate credential fields, or malformed maps are diagnostic
+errors. A filesystem UID of zero uses the existing **traditional privileged root**
+assumption, including the non-directory execute-bit rule.
+
+This is still a limited access model. Effective capabilities (`CapEff`) are
+observed, not evaluated. UID zero does not prove actual privilege, and a nonzero
+UID can have capabilities not represented by this model. LSM policy, inode flags,
+idmapped mounts, and filesystem-specific authorization remain unmodeled.
+
+**Paths are absolute paths in the debugger's root and mount namespace.** Relative
+targets are rejected (code 2); no process cwd or chroot-relative path translation
+is attempted. `/proc/PID/root` is compared with the debugger's root using the
+observed paths and device/inode identity. Mount and user namespace identifiers
+are compared with `/proc/self/ns/mnt` and `/proc/self/ns/user`. A differing or
+uninspectable root, mount namespace, or user namespace prevents evaluation:
+the result is **INDETERMINATE (3)**, never a fabricated permission denial.
+No `nsenter`, `setns`, chroot, or host/container path guessing occurs.
+Process-sensitive magic paths such as `/proc/self` retain the debugger's meaning;
+they are not translated into the inspected process's view.
+
+UID/GID maps are parsed and reported as observations, not applied to authorization.
+In a different user namespace the command conservatively stops even if a mapping
+looks simple. A map that cannot be read due to permissions is recorded as unknown;
+equal namespace identifiers still establish that no cross-namespace translation
+is being attempted. Missing proc metadata or a process disappearing during the
+snapshot produces an error.
+
+The collector checks `/proc/PID/stat` start time to detect PID reuse and rereads
+credentials during collection. After permission analysis, it collects the process
+context again. Changed credentials, start time, root, namespace, or a vanished PID
+discard the provisional diagnosis and produce an indeterminate result. This is
+**not atomic**: a change-and-restore race, filesystem race, or change after the
+last check can still invalidate the observation. Linux credentials are per-thread;
+the numeric task visible at `/proc/PID` is inspected, not every thread in a group.
+
+Illustrative normal-process excerpt:
+
+```text
+PERMISSION HELL v0.7 | PROCESS DIAGNOSE
+PID: 1842
+Process: 'nginx'
+Target: '/srv/site/index.html'
+Requested: READ
+
+PROCESS CREDENTIALS
+  ruid=33 euid=33 suid=33 fsuid=33
+  rgid=33 egid=33 sgid=33 fsgid=33
+  Used for filesystem checks: UID 33 (filesystem), GID 33 (filesystem)
+
+NAMESPACES
+  mount: same as debugger (mnt:[4026531841])
+  user: same as debugger (user:[4026531837])
+  root: '/' (matches debugger: True)
+
+RESULT: PERMITTED
+```
+
+Differing credentials are explicit; for example, with `ruid=1000 euid=33 suid=33
+fsuid=33`, UID **33** is used. If a 0600 target belongs to UID 1000, real UID
+ownership does not grant read access to filesystem UID 33. The output shows the
+selected GROUP/OTHER or ACL mechanism and the actual blocker.
+
+A foreign namespace instead yields an excerpt such as:
+
+```text
+RESULT: INDETERMINATE
+
+WHY
+PID 1842 has a different mount namespace from the debugger; foreign namespaces/root mappings are not evaluated.
+```
+
+`--verbose` includes full inode detail, process start time, observed maps and
+CapEff. `--json` includes that structured information without changing format
+when verbose is supplied. There is **no process `--suggest-fixes` option**; it is
+rejected by argparse. No process-credential changes or account-based remediation
+commands are inferred from a PID. Account remediation remains unchanged.
+
+Process exit codes: 0 modeled permit; 1 modeled denial; 2 invalid PID/path or a
+PID initially absent/not visible in procfs; 3 inaccessible or inconsistent proc
+metadata, namespace/root limitations, inspection errors, or disappearance after
+inspection began. Procfs hiding can make an existing PID appear absent.
+
+JSON schema stays **1**: the new `command: "process"` / `mode: "process"` document
+adds `pid`, `process`, `path_context`, `limitations`, and `model_limitations`.
+Existing command documents retain their field meanings. Process-only code 3
+uses `verdict: "indeterminate"`; account-mode error verdicts are unchanged.
+`process.credentials.uids` and `.gids` contain real/effective/saved/filesystem
+`{id, name}` objects. `filesystem_identity` gives the UID/GID actually used and
+their `filesystem` or `effective_fallback` source plus supplementary GIDs.
+`namespaces` and `root` expose identifiers, comparisons and inspection errors.
+Maps are arrays of `{inside, outside, length}` with
+`maps_used_for_authorization: false`; capabilities are similarly marked unused.
+Unknown names or observations are null. On a context limitation, access-path
+observations are empty and no target or mount permission verdict is fabricated.
+
+**Privacy:** process JSON/text can reveal comm names, IDs, live groups, namespace
+relationships, root paths, and mappings. Command-line arguments, environment,
+process memory, target contents, and secrets are not collected. Runtime inspection
+only reads proc/identity/filesystem metadata: it sends no signals and modifies no
+credentials, target files, namespaces, mounts, or process state.
+
+Credential semantics follow Linux [proc_pid_status(5)](https://man7.org/linux/man-pages/man5/proc_pid_status.5.html)
+and [credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html).
+Root and namespace observations follow [proc_pid_root(5)](https://man7.org/linux/man-pages/man5/proc_pid_root.5.html)
+and [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html).
+
 ## Focused audit explanations (v0.4)
 
 ```bash
@@ -105,7 +231,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.6 | AUDIT EXPLAIN
+PERMISSION HELL v0.7 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -130,7 +256,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.6 | AUDIT EXPLAIN
+PERMISSION HELL v0.7 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -163,9 +289,9 @@ input/path and 3 for incomplete inspection. A known denial remains definitive
 even when mount inspection is unavailable, with that limitation shown.
 
 The canonical version is `permissionhell.__version__`. Package metadata and
-`--version` use its full value (**0.6.0**); all report headings derive their compact
-label (**v0.6**) from it. Nonzero patch versions remain visible (for example,
-`0.6.1` displays as `v0.6.1`). The permission model is unchanged.
+`--version` use its full value (**0.7.0**); all report headings derive their compact
+label (**v0.7**) from it. Nonzero patch versions remain visible (for example,
+`0.7.1` displays as `v0.7.1`). The DAC/ACL/mount permission model is unchanged.
 
 ## Informational change suggestions (v0.5)
 
@@ -251,7 +377,7 @@ unchanged identity/metadata state must be verified before manually applying ACLs
 
 `RemediationSuggestion` holds category, title, commands, effect, and caveats.
 `suggest_remediations()` consumes a `Diagnosis` without mutation or extra system
-inspection; a separate renderer formats it. Package/CLI version is **0.6.0**;
+inspection; a separate renderer formats it. Package/CLI version is **0.7.0**;
 all explanation and diagnostic banners use the same canonical version source.
 
 ## JSON output (v0.6, schema 1)
@@ -281,9 +407,9 @@ Common envelope fields:
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | String `"1"`, independent of the tool release |
-| `tool` | `{ "name": "permissionhell", "version": "0.6.0" }` |
-| `command` | `diagnose` or `audit` |
-| `mode` | `diagnose`, `audit`, or `explain` |
+| `tool` | `{ "name": "permissionhell", "version": "0.7.0" }` |
+| `command` | `diagnose`, `audit`, or `process` |
+| `mode` | `diagnose`, `audit`, `explain`, or `process` |
 | `requested_mode` | `r`, `w`, or `x` |
 | `target_path` | Original target, without normalizing away traversal |
 | `verdict`, `exit_code` | Mode-specific result and actual process exit code |
@@ -326,7 +452,7 @@ Small diagnose example, selected fields only:
 ```json
 {
   "schema_version": "1",
-  "tool": {"name": "permissionhell", "version": "0.6.0"},
+  "tool": {"name": "permissionhell", "version": "0.7.0"},
   "command": "diagnose",
   "mode": "diagnose",
   "requested_mode": "r",
@@ -421,7 +547,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.6 | ACCESS AUDIT
+PERMISSION HELL v0.7 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -519,7 +645,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.6 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.7 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -599,7 +725,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.6 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.7 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -738,8 +864,8 @@ files when imported; use `python3 -B` if those should also be suppressed.
 
 In addition to the excluded security layers stated above:
 
-- Identity comes from current account databases, not an existing process's
-  potentially stale supplementary groups, fsuid/fsgid, or credentials.
+- Account modes use current account databases; process mode uses observed
+  filesystem IDs and live supplementary groups from procfs.
 - Paths and mounts are inspected in the debugger's namespace and filesystem
   root, not another process's container, chroot, or service sandbox.
 - Inspection is a sequence of observations, not an atomic snapshot. Concurrent
@@ -812,7 +938,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Audit account filtering.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
-- Process-aware credentials, capability sets, and mount namespaces.
+- Capability-aware process checks and safely evaluating foreign namespaces.
 - Container mappings and filesystem-specific behavior.
 
 Semantics references: Linux [path_resolution(7)](https://man7.org/linux/man-pages/man7/path_resolution.7.html)

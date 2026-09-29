@@ -16,8 +16,9 @@ import stat
 import sys
 
 import json_output
+from process_subject import ProcessSubject, ProcessInspectionError, inspect_process
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 def display_version() -> str:
@@ -513,6 +514,52 @@ def explain_audit_target(path: str, username: str, mode: str = "r") -> AuditExpl
     return AuditExplanation(diagnose(path, resolve_subject(username), mode))
 
 
+@dataclass
+class ProcessDiagnosis:
+    requested_path: str
+    pid: int
+    mode: str
+    process: ProcessSubject | None = None
+    diagnosis: Diagnosis | None = None
+    limitations: list[str] = field(default_factory=list)
+    code: ExitCode = ExitCode.ERROR
+
+
+def process_filesystem_subject(process: ProcessSubject) -> Subject:
+    """Adapt proc credentials to the existing DAC/ACL interface; no NSS groups."""
+    uid, gid = process.status.uids.used, process.status.gids.used
+    return Subject(process.uid_names.get(uid) or str(uid), uid, gid, process.gid_names.get(gid) or str(gid),
+                   process.status.supplementary_gids,
+                   tuple(process.gid_names.get(g) or str(g) for g in process.status.supplementary_gids))
+
+
+def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
+    report = ProcessDiagnosis(path, pid, mode)
+    if not path.startswith("/") or "\x00" in path:
+        report.code = ExitCode.INPUT
+        report.limitations.append("Process targets must be absolute paths in the debugger's root; no process cwd translation is performed.")
+        return report
+    try:
+        report.process = inspect_process(pid)
+        report.limitations.extend(report.process.limitations)
+        if report.limitations:
+            return report
+        diagnosis = diagnose(path, process_filesystem_subject(report.process), mode)
+        # Recheck identity, credentials, root and namespaces after the path walk.
+        # A changed/exited/reused PID must not inherit the earlier observation's verdict.
+        try:
+            after = inspect_process(pid)
+        except ProcessInspectionError as exc:
+            raise ProcessInspectionError(f"PID {pid} could not be revalidated after analysis: {exc}") from exc
+        if after != report.process:
+            raise ProcessInspectionError(f"PID {pid} identity, credentials, or context changed during analysis; retry")
+        report.diagnosis, report.code = diagnosis, diagnosis.code
+    except (ProcessInspectionError, DiagnosticError, OSError) as exc:
+        report.code = ExitCode(exc.code) if hasattr(exc, "code") else ExitCode.ERROR
+        report.limitations.append(str(exc))
+    return report
+
+
 def bits(value: int) -> str:
     return "".join(letter if value & bit else "-" for bit, letter in ((4, "r"), (2, "w"), (1, "x")))
 
@@ -695,7 +742,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
-def render_verbose_report(report: Diagnosis) -> str:
+def render_verbose_report(report: Diagnosis, *, scope_text: str = SCOPE_TEXT) -> str:
     subject = report.subject
     lines = [f"PERMISSION HELL {display_version()}", f"Diagnosing {OPERATIONS[report.mode][1]} access", "",
              "SUBJECT", f"User: {subject.username} (UID {subject.uid})",
@@ -738,7 +785,7 @@ def render_verbose_report(report: Diagnosis) -> str:
                       f"Status: {'READ-ONLY' if mount.readonly else 'READ-WRITE'}"])
     else:
         lines.append(report.mount_error or "Not evaluated: target path was not resolved.")
-    lines.extend(["", verdict_label(report) + f" ({display_version()} DAC + ACL + mount model)", *report.reasons, "", SCOPE_TEXT])
+    lines.extend(["", verdict_label(report) + f" ({display_version()} DAC + ACL + mount model)", *report.reasons, "", scope_text])
     return "\n".join(lines)
 
 
@@ -949,6 +996,14 @@ def render_audit_explanation(explanation: AuditExplanation, verbose: bool = Fals
     lines = [f"PERMISSION HELL {display_version()} | AUDIT EXPLAIN", f"Target: {report.requested_path!r}",
              f"Subject: {subject.username} (UID {subject.uid})",
              f"Requested: {OPERATIONS[report.mode][1]}", "", f"RESULT: {result}", "", "ACCESS PATH"]
+    lines.extend(explanation_detail_lines(report, verbose))
+    return "\n".join(lines)
+
+
+def explanation_detail_lines(report: Diagnosis, verbose: bool = False, *, scope_text: str = SCOPE_TEXT) -> list[str]:
+    """Shared presentation of an already-evaluated account or process identity."""
+    subject, trace = report.subject, report.trace
+    lines = []
     if subject.uid == 0:
         lines.append("  ROOT: assumes traditional privileged UID 0; overrides marked where applied.")
     seen = set()
@@ -999,7 +1054,44 @@ def render_audit_explanation(explanation: AuditExplanation, verbose: bool = Fals
     else:
         lines.extend("  " + reason for reason in concise_reasons(report))
     if verbose:
-        lines.extend(["", "FULL DIAGNOSTIC DETAIL", render_verbose_report(report)])
+        lines.extend(["", "FULL DIAGNOSTIC DETAIL", render_verbose_report(report, scope_text=scope_text)])
+    return lines
+
+
+def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> str:
+    lines = [f"PERMISSION HELL {display_version()} | PROCESS DIAGNOSE", f"PID: {report.pid}",
+             f"Target: {report.requested_path!r}", f"Requested: {OPERATIONS[report.mode][1]}"]
+    process = report.process
+    if process:
+        status = process.status
+        lines.extend([f"Process: {status.name!r}", "", "PROCESS CREDENTIALS",
+                      f"  ruid={status.uids.real} euid={status.uids.effective} suid={status.uids.saved} fsuid={status.uids.filesystem}",
+                      f"  rgid={status.gids.real} egid={status.gids.effective} sgid={status.gids.saved} fsgid={status.gids.filesystem}",
+                      f"  Used for filesystem checks: UID {status.uids.used} ({status.uids.source}), GID {status.gids.used} ({status.gids.source})",
+                      "  Supplementary: " + (", ".join(f"{process.gid_names.get(g) or g!r} (GID {g})" for g in status.supplementary_gids) or "none"),
+                      "", "NAMESPACES"])
+        for label, observation in (("mount", process.mount_namespace), ("user", process.user_namespace)):
+            comparison = {True: "same as debugger", False: "different from debugger", None: "unknown"}[observation.matches_debugger]
+            lines.append(f"  {label}: {comparison} ({observation.identifier})")
+        lines.extend([f"  root: {process.root.path!r} (matches debugger: {process.root.matches_debugger})",
+                      "  Target interpretation: debugger's absolute path, root and mount namespace."])
+        lines.extend("  Note: " + note for note in process.notes)
+        if verbose:
+            lines.extend([f"  PID start time (ticks): {process.start_time_ticks}",
+                          f"  UID map (observed only): {process.uid_map}",
+                          f"  GID map (observed only): {process.gid_map}",
+                          f"  CapEff (observed, not evaluated): {status.effective_capabilities}"])
+    result = {ExitCode.ALLOWED: "PERMITTED", ExitCode.DENIED: "DENIED",
+              ExitCode.INPUT: "INVALID INPUT / UNRESOLVED PATH", ExitCode.ERROR: "INDETERMINATE"}[report.code]
+    lines.extend(["", f"RESULT: {result}"])
+    if report.diagnosis:
+        process_scope = SCOPE_TEXT.replace("account database groups", "observed process filesystem IDs and live supplementary groups")
+        lines.extend(["", "ACCESS PATH", *explanation_detail_lines(report.diagnosis, verbose, scope_text=process_scope)])
+    else:
+        lines.extend(["", "WHY", *report.limitations])
+    lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL/mount; UID 0 assumes traditional privileged root.",
+                  "Capabilities, LSM policies, namespace mappings and actual syscall success are not modeled.",
+                  "Process snapshots are not atomic. Process remediation commands are not supported."])
     return "\n".join(lines)
 
 
@@ -1154,17 +1246,32 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--suggest-fixes", action="store_true", help="With --explain, show informational change alternatives; never execute them")
     audit.add_argument("--verbose", action="store_true",
                        help="Show every account without grouping; with --explain, add full diagnostic detail")
+    process = commands.add_parser("process", help="Evaluate a running PID's filesystem credentials",
+                                  epilog="Absolute debugger-visible paths only; foreign roots/namespaces are indeterminate. No process fixes.")
+    process.add_argument("target_path")
+    def pid_argument(value: str) -> int:
+        if not re.fullmatch(r"[0-9]{1,10}", value) or not 0 < int(value) <= 0x7FFFFFFF:
+            raise argparse.ArgumentTypeError("PID must be a positive Linux process ID")
+        return int(value)
+    process.add_argument("--pid", required=True, type=pid_argument)
+    process.add_argument("--mode", choices=OPERATIONS, default="r")
+    process.add_argument("--json", action="store_true", help="Emit schema 1 JSON, including process metadata")
+    process.add_argument("--verbose", action="store_true", help="Show full trace and observed process maps/capabilities")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
     def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
         if args.json:
-            username = args.username if args.command == "diagnose" else args.explain
+            username = args.username if args.command == "diagnose" else getattr(args, "explain", None)
             mode = "explain" if args.command == "audit" and args.explain is not None else args.command
             document = json_output.error_document(__version__, args.command, mode, args.target_path,
                                                   args.mode, username, message, code, stage)
             if getattr(args, "suggest_fixes", False):
                 document["remediations"] = []
+            if args.command == "process":
+                document.update({"pid": args.pid, "process": None, "limitations": [message]})
+                if code == ExitCode.ERROR:
+                    document["verdict"] = "indeterminate"
             print(json_output.render_json(document), end="")
         else:
             print(f"permissionhell: {message}", file=sys.stderr)
@@ -1172,6 +1279,13 @@ def main(argv: list[str] | None = None) -> int:
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command == "process":
+            process_report = diagnose_process(args.target_path, args.pid, args.mode)
+            if args.json:
+                print(json_output.render_json(json_output.process_document(process_report, __version__)), end="")
+            else:
+                print(render_process_report(process_report, verbose=args.verbose))
+            return process_report.code
         if args.command == "audit":
             if args.explain is not None:
                 explanation = explain_audit_target(args.target_path, args.explain, args.mode)

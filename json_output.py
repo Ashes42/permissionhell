@@ -11,7 +11,8 @@ import stat
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from permissionhell import Diagnosis, Inode, Subject, AuditReport, RemediationSuggestion
+    from permissionhell import Diagnosis, Inode, Subject, AuditReport, RemediationSuggestion, ProcessDiagnosis
+    from process_subject import ProcessSubject
 
 
 SCHEMA_VERSION = "1"
@@ -172,6 +173,52 @@ def error_document(version: str, command: str, mode: str, path: str, requested_m
     result = envelope(version, command, mode, path, requested_mode)
     result.update({"requested_username": username, "subject": None, "verdict": VERDICTS[code],
                    "exit_code": int(code), "errors": [error_data(message, code, stage)]})
+    return result
+
+
+def process_subject_data(process: ProcessSubject) -> dict:
+    status = process.status
+    def credentials(ids, names):
+        return {key: {"id": getattr(ids, key), "name": names.get(getattr(ids, key))}
+                for key in ("real", "effective", "saved", "filesystem")}
+    def namespace(observation):
+        return {"identifier": observation.identifier, "debugger_identifier": observation.debugger_identifier,
+                "matches_debugger": observation.matches_debugger, "error": observation.error}
+    def mappings(entries):
+        return [{"inside": e.inside, "outside": e.outside, "length": e.length} for e in entries] if entries is not None else None
+    root = process.root
+    return {"pid": process.pid, "name": status.name, "start_time_ticks": process.start_time_ticks,
+            "credentials": {"uids": credentials(status.uids, process.uid_names),
+                            "gids": credentials(status.gids, process.gid_names),
+                            "supplementary_groups": [{"gid": g, "name": process.gid_names.get(g)} for g in status.supplementary_gids]},
+            "filesystem_identity": {"uid": status.uids.used, "gid": status.gids.used,
+                                    "uid_source": status.uids.source, "gid_source": status.gids.source,
+                                    "supplementary_gids": list(status.supplementary_gids)},
+            "namespaces": {"mount": namespace(process.mount_namespace), "user": namespace(process.user_namespace)},
+            "root": {"path": root.path, "device": root.device, "inode": root.inode,
+                     "debugger_path": root.debugger_path, "debugger_device": root.debugger_device,
+                     "debugger_inode": root.debugger_inode, "matches_debugger": root.matches_debugger, "error": root.error},
+            "uid_map": mappings(process.uid_map), "gid_map": mappings(process.gid_map),
+            "maps_used_for_authorization": False, "effective_capabilities": status.effective_capabilities,
+            "capabilities_used_for_authorization": False, "notes": list(process.notes)}
+
+
+def process_document(report: ProcessDiagnosis, version: str) -> dict:
+    result = envelope(version, "process", "process", report.requested_path, report.mode)
+    if report.diagnosis:
+        result.update(diagnosis_data(report.diagnosis))
+    else:
+        result.update({"subject": None, "resolved_target_path": None, "access_path": [], "target_inode": None,
+                       "mount": None, "first_blocker": None, "reasons": list(report.limitations), "errors": []})
+    result.update({"pid": report.pid, "process": process_subject_data(report.process) if report.process else None,
+                   "path_context": "debugger_absolute_path_root_and_mount_namespace",
+                   "limitations": list(report.limitations),
+                   "model_limitations": ["Capabilities and LSM policies are not evaluated; UID 0 assumes traditional privileged root.",
+                                         "Foreign user/mount namespaces and roots are not entered or mapped.",
+                                         "Snapshots are not atomic; no guarantee of actual syscall success.",
+                                         "Process remediation is not supported."],
+                   "verdict": "indeterminate" if report.code == 3 else VERDICTS[report.code], "exit_code": int(report.code)})
+    result["errors"].extend(error_data(message, report.code, "process") for message in report.limitations)
     return result
 
 
