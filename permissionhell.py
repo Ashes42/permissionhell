@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import IntEnum
 import errno
 import os
@@ -17,8 +17,9 @@ import sys
 
 import json_output
 from process_subject import ProcessSubject, ProcessInspectionError, inspect_process
+from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 
 def display_version() -> str:
@@ -59,6 +60,9 @@ class Subject:
     primary_group: str
     supplementary_gids: tuple[int, ...]
     supplementary_groups: tuple[str, ...]
+    process_identity: bool = False
+    effective_capabilities: CapabilitySet | None = None
+    capability_context_supported: bool = True
 
     @property
     def gids(self) -> frozenset[int]:
@@ -117,7 +121,7 @@ def evaluate_permission(subject: Subject, inode: os.stat_result, mode: str) -> P
     available = (inode.st_mode >> shift) & 7
     allowed = bool(available & required)
     override = False
-    if subject.uid == 0:
+    if subject.uid == 0 and not subject.process_identity:
         # Explicit v0.1 assumption: traditional privileged root, not namespaced root.
         allowed = mode != "x" or stat.S_ISDIR(inode.st_mode) or bool(inode.st_mode & 0o111)
         override = allowed and not bool(available & required)
@@ -142,6 +146,8 @@ class Inode:
     acl_match: ACLMatch | None = None
     acl_note: str | None = None
     dac_decision: PermissionDecision | None = None
+    base_decision: PermissionDecision | None = None
+    capability_decision: CapabilityDecision | None = None
 
 
 def inspect_inode(path: str, metadata: os.stat_result, subject: Subject, mode: str) -> Inode:
@@ -151,7 +157,7 @@ def inspect_inode(path: str, metadata: os.stat_result, subject: Subject, mode: s
     # These decisions are independent of access ACLs. Owner bits mirror user::,
     # which is unmasked; our documented privileged-root model bypasses ACL DAC.
     # Avoid an unnecessary xattr dependency when the answer is already known.
-    if subject.uid == 0:
+    if subject.uid == 0 and not subject.process_identity:
         note = "ACL inspection not needed: traditional privileged root bypasses ACL DAC; execute-bit checks still apply."
     elif subject.uid == metadata.st_uid:
         note = "ACL inspection not needed: OWNER mode bits equal unmasked user:: permissions; no named entry can override them."
@@ -169,8 +175,17 @@ def inspect_inode(path: str, metadata: os.stat_result, subject: Subject, mode: s
             decision = PermissionDecision(selected, match.effective, dac.required, match.allowed,
                 f"POSIX access ACL {'permits' if match.allowed else 'denies'} {OPERATIONS[mode][1]}"
                 f" via {match.selection.lower()} selection; no fallback after a match.")
+    base = capability = None
+    if subject.process_identity:
+        base = decision
+        try:
+            capability = evaluate_capabilities(base.allowed, metadata.st_mode, base.required,
+                                                subject.effective_capabilities, subject.capability_context_supported)
+        except CapabilityError as exc:
+            raise DiagnosticError(f"Capability inspection at {path!r}: {exc}") from exc
+        decision = replace(base, allowed=capability.allowed, reason=base.reason + " " + capability.reason)
     return Inode(path, metadata.st_uid, metadata.st_gid, owner_name(metadata.st_uid),
-                 group_name(metadata.st_gid), metadata.st_mode, decision, acl, match, note, dac)
+                 group_name(metadata.st_gid), metadata.st_mode, decision, acl, match, note, dac, base, capability)
 
 
 @dataclass(frozen=True)
@@ -528,9 +543,14 @@ class ProcessDiagnosis:
 def process_filesystem_subject(process: ProcessSubject) -> Subject:
     """Adapt proc credentials to the existing DAC/ACL interface; no NSS groups."""
     uid, gid = process.status.uids.used, process.status.gids.used
+    # Conservative support boundary for capabilities: no namespace translation.
+    supported = all(mapping is not None and len(mapping) == 1 and
+                    (mapping[0].inside, mapping[0].outside, mapping[0].length) == (0, 0, 0xFFFFFFFF)
+                    for mapping in (process.uid_map, process.gid_map))
     return Subject(process.uid_names.get(uid) or str(uid), uid, gid, process.gid_names.get(gid) or str(gid),
                    process.status.supplementary_gids,
-                   tuple(process.gid_names.get(g) or str(g) for g in process.status.supplementary_gids))
+                   tuple(process.gid_names.get(g) or str(g) for g in process.status.supplementary_gids),
+                   True, process.status.capabilities.effective, supported)
 
 
 def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
@@ -585,7 +605,9 @@ def verdict_label(report: Diagnosis) -> str:
 def access_summary(inode: Inode, subject: Subject) -> str:
     decision = inode.decision
     ordinary = f"{decision.permission_class} {bits(decision.available)}"
-    if subject.uid == 0:
+    if inode.capability_decision and inode.capability_decision.applied:
+        return f"CAPABILITY {inode.capability_decision.capability} [base {ordinary}]"
+    if subject.uid == 0 and not subject.process_identity:
         label = "ROOT OVERRIDE" if decision.root_override else "ROOT"
         return f"{label} [ordinary {ordinary}]"
     if acl_relevant(inode):
@@ -643,8 +665,9 @@ def render_acl(inode: Inode, verbose: bool = False) -> list[str]:
                 lines.append("    Mode group bits represent mask::, not group:: permissions.")
                 if inode.dac_decision:
                     dac = inode.dac_decision
+                    conclusion = "base ACL result shown; capability follows." if inode.capability_decision else "ACL result governs."
                     lines.append(f"    Mode-only comparison: {dac.permission_class} {bits(dac.available)}"
-                                 f" -> {'PERMITTED' if dac.allowed else 'DENIED'}; ACL result governs.")
+                                 f" -> {'PERMITTED' if dac.allowed else 'DENIED'}; {conclusion}")
             return lines
     if acl_relevant(inode):
         return [f"  {acl_explanation(inode)}"]
@@ -653,6 +676,9 @@ def render_acl(inode: Inode, verbose: bool = False) -> list[str]:
 
 def denial_explanation(inode: Inode, subject: Subject) -> str:
     decision = inode.decision
+    if subject.process_identity and inode.capability_decision:
+        base = acl_explanation(inode) if acl_relevant(inode) else inode.base_decision.reason
+        return base + " " + inode.capability_decision.reason
     if subject.uid == 0:
         return "Root still needs at least one execute bit on a non-directory inode; none is set."
     if acl_relevant(inode):
@@ -693,7 +719,7 @@ def render_report(report: Diagnosis, verbose: bool = False) -> str:
     lines = [f"PERMISSION HELL {display_version()} | {OPERATIONS[report.mode][1]} as {subject.username} (UID {subject.uid})",
              f"Target: {path}", "", f"{verdict_label(report)} (DAC + ACL + mount model)",
              *concise_reasons(report)]
-    if subject.uid == 0:
+    if subject.uid == 0 and not subject.process_identity:
         lines.append("Root: assumes privileged UID 0; DAC bypasses are marked ROOT OVERRIDE.")
     lines.extend(["", "PATH (search x)"])
     seen = set()
@@ -771,8 +797,10 @@ def render_verbose_report(report: Diagnosis, *, scope_text: str = SCOPE_TEXT) ->
                       f"Access: {access_summary(target, subject)}",
                       f"Required: {OPERATIONS[report.mode][1]} ({report.mode})",
                       f"Available: {bits(target.decision.available)}",
-                      f"DAC: {'PERMITTED' if target.decision.allowed else 'DENIED'}",
+                      f"{'Effective DAC/ACL/capability result' if target.base_decision else 'DAC'}: {'PERMITTED' if target.decision.allowed else 'DENIED'}",
                       target.decision.reason])
+        if target.base_decision:
+            lines.append(f"Base DAC/ACL: {'PERMITTED' if target.base_decision.allowed else 'DENIED'}")
         lines.extend(render_acl(target, verbose=True))
     else:
         lines.append("Not evaluated: path resolution/traversal did not complete.")
@@ -790,7 +818,9 @@ def render_verbose_report(report: Diagnosis, *, scope_text: str = SCOPE_TEXT) ->
 
 
 def audit_access_reason(inode: Inode, subject: Subject) -> str:
-    if subject.uid == 0:
+    if inode.capability_decision and inode.capability_decision.applied:
+        return "Ordinary DAC/ACL would deny. " + inode.capability_decision.reason
+    if subject.uid == 0 and not subject.process_identity:
         return f"Access via {access_summary(inode, subject)}; assumes traditional privileged UID 0."
     if acl_relevant(inode):
         reason = acl_explanation(inode)
@@ -967,13 +997,16 @@ def explanation_inode_lines(inode: Inode, subject: Subject, operation: str,
     lines = [f"  {inode.path!r}  {'PASS' if decision.allowed else 'FAIL'} {operation}"
              f" | {access_summary(inode, subject)}{marker}"]
     if acl_relevant(inode):
-        lines.append("    " + acl_explanation(inode))
+        lines.append("    " + ("Base " if inode.capability_decision else "") + acl_explanation(inode))
+    if inode.capability_decision and inode.capability_decision.applied:
+        lines.extend(["    DAC/ACL would DENY; capability override: " + inode.capability_decision.capability,
+                      "    " + inode.capability_decision.reason + " Effective result: PASS."])
     # Use captured identity data only; rendering must not query NSS or the disk.
     matched_gids = set()
     if inode.acl_match and inode.acl_match.selection == "GROUP":
         matched_gids = {inode.gid if entry.tag == Tag.GROUP_OBJ else entry.qualifier
                         for entry in inode.acl_match.entries}
-    elif decision.permission_class == "GROUP" and subject.uid != 0:
+    elif decision.permission_class == "GROUP" and (subject.uid != 0 or subject.process_identity):
         matched_gids = {inode.gid}
     names = dict(zip(subject.supplementary_gids, subject.supplementary_groups))
     for gid in sorted(matched_gids):
@@ -984,6 +1017,8 @@ def explanation_inode_lines(inode: Inode, subject: Subject, operation: str,
     # Relevant ACL detail above already includes the denial explanation.
     if not decision.allowed and not acl_relevant(inode):
         lines.append("    " + denial_explanation(inode, subject))
+    elif not decision.allowed and inode.capability_decision:
+        lines.append("    " + inode.capability_decision.reason)
     return lines
 
 
@@ -1004,7 +1039,7 @@ def explanation_detail_lines(report: Diagnosis, verbose: bool = False, *, scope_
     """Shared presentation of an already-evaluated account or process identity."""
     subject, trace = report.subject, report.trace
     lines = []
-    if subject.uid == 0:
+    if subject.uid == 0 and not subject.process_identity:
         lines.append("  ROOT: assumes traditional privileged UID 0; overrides marked where applied.")
     seen = set()
     blocked = False
@@ -1076,21 +1111,37 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
         lines.extend([f"  root: {process.root.path!r} (matches debugger: {process.root.matches_debugger})",
                       "  Target interpretation: debugger's absolute path, root and mount namespace."])
         lines.extend("  Note: " + note for note in process.notes)
+        sets = status.capabilities
+        effective = sets.effective
+        effective_names = effective.names if effective else ()
+        display_names = effective_names if verbose else effective_names[:6]
+        more = f" (+{len(effective_names) - 6} others; --verbose)" if not verbose and len(effective_names) > 6 else ""
+        relevant = [name for name in effective_names if name in ("CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH")]
+        lines.extend(["", "CAPABILITIES", "  Effective: " + (", ".join(display_names) or ("none" if effective else "unavailable")) + more,
+                      "  Relevant modeled effective: " + (", ".join(relevant) or "none"),
+                      "  Live process model: UID 0 alone grants no bypass; only effective capabilities apply."])
+        if effective and effective.unknown_bits:
+            lines.append(f"  Unknown effective capability bits (not modeled): {effective.unknown_bits}")
         if verbose:
             lines.extend([f"  PID start time (ticks): {process.start_time_ticks}",
                           f"  UID map (observed only): {process.uid_map}",
                           f"  GID map (observed only): {process.gid_map}",
-                          f"  CapEff (observed, not evaluated): {status.effective_capabilities}"])
+                          f"  CapEff: {status.effective_capabilities}"])
+            for name in ("inheritable", "permitted", "effective", "bounding", "ambient"):
+                observed = getattr(sets, name)
+                lines.append(f"  {name}: " + (f"{', '.join(observed.names) or 'none'}; mask={observed.mask:x}; unknown_bits={observed.unknown_bits}"
+                                              if observed is not None else "unavailable"))
     result = {ExitCode.ALLOWED: "PERMITTED", ExitCode.DENIED: "DENIED",
               ExitCode.INPUT: "INVALID INPUT / UNRESOLVED PATH", ExitCode.ERROR: "INDETERMINATE"}[report.code]
     lines.extend(["", f"RESULT: {result}"])
     if report.diagnosis:
-        process_scope = SCOPE_TEXT.replace("account database groups", "observed process filesystem IDs and live supplementary groups")
+        process_scope = ("Scope: live process fsuid/fsgid/groups, effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH; "
+                         "no UID-0 shortcut. Foreign namespaces, LSM policies and actual syscall success are not modeled.")
         lines.extend(["", "ACCESS PATH", *explanation_detail_lines(report.diagnosis, verbose, scope_text=process_scope)])
     else:
         lines.extend(["", "WHY", *report.limitations])
-    lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL/mount; UID 0 assumes traditional privileged root.",
-                  "Capabilities, LSM policies, namespace mappings and actual syscall success are not modeled.",
+    lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL + effective DAC capabilities + mount restrictions.",
+                  "LSM policies, other capability effects, namespace translation and actual syscall success are not modeled.",
                   "Process snapshots are not atomic. Process remediation commands are not supported."])
     return "\n".join(lines)
 
@@ -1111,6 +1162,9 @@ def suggest_remediations(report: Diagnosis) -> list[RemediationSuggestion]:
     observed access check does not establish policy or a safe persistent layout.
     """
     suggestions = []
+    if report.subject.process_identity:
+        return [RemediationSuggestion("STRUCTURAL CHANGE", "Process remediation is unsupported", (),
+                "Live capability or credential changes are not suggested; no setcap commands are generated.")]
     if report.code not in (ExitCode.ALLOWED, ExitCode.DENIED):
         return [RemediationSuggestion("STRUCTURAL CHANGE", "Resolve the inspection failure first", (),
                 "No reliable permission change can be derived from an incomplete diagnosis.")]

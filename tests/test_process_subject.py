@@ -214,11 +214,12 @@ class ProcessEvaluationTests(unittest.TestCase):
         self.assertEqual(report.code, 0)
         self.assertEqual(report.diagnosis.trace.target.decision.permission_class, "GROUP")
 
-    def test_root_fsuid_override(self):
+    def test_root_fsuid_without_capability_does_not_override(self):
         process = snapshot(STATUS.replace("1000 1001 1002 9000", "1000 1001 1002 0"))
         report = self.evaluate(process, target_mode=0)
-        self.assertEqual(report.code, 0)
-        self.assertTrue(report.diagnosis.trace.target.decision.root_override)
+        self.assertEqual(report.code, 1)
+        self.assertFalse(report.diagnosis.trace.target.decision.root_override)
+        self.assertFalse(report.diagnosis.trace.target.capability_decision.applied)
 
     def test_root_fsuid_execute_denial(self):
         process = snapshot(STATUS.replace("1000 1001 1002 9000", "1000 1001 1002 0"))

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
+from capabilities import ProcessCapabilities, CapabilityError, STATUS_FIELDS, parse_capability_fields
 
 try:
     import pwd
@@ -43,6 +44,7 @@ class ProcessStatus:
     gids: CredentialIDs
     supplementary_gids: tuple[int, ...]
     effective_capabilities: str | None
+    capabilities: ProcessCapabilities = field(default_factory=ProcessCapabilities)
 
 
 @dataclass(frozen=True)
@@ -109,7 +111,7 @@ def parse_status(text: str) -> ProcessStatus:
     fields = {}
     for line in text.splitlines():
         key, separator, value = line.partition(":")
-        if separator and key in ("Name", "Uid", "Gid", "Groups", "CapEff"):
+        if separator and (key in ("Name", "Uid", "Gid", "Groups") or key in STATUS_FIELDS):
             if key in fields:
                 raise ProcessInspectionError(f"Duplicate process status field: {key}")
             fields[key] = value.strip()
@@ -123,10 +125,11 @@ def parse_status(text: str) -> ProcessStatus:
     if "Groups" not in fields:
         raise ProcessInspectionError("Missing Groups field in process status; membership is unknown")
     groups = tuple(sorted({numeric_id(v) for v in fields["Groups"].split()}))
-    capabilities = fields.get("CapEff")
-    if capabilities is not None and not re.fullmatch(r"[0-9a-fA-F]{1,16}", capabilities):
-        raise ProcessInspectionError("Malformed CapEff field in process status")
-    return ProcessStatus(fields.get("Name"), uids, gids, groups, capabilities)
+    try:
+        capabilities = parse_capability_fields(fields)
+    except CapabilityError as exc:
+        raise ProcessInspectionError(str(exc)) from exc
+    return ProcessStatus(fields.get("Name"), uids, gids, groups, fields.get("CapEff"), capabilities)
 
 
 def parse_id_map(text: str) -> tuple[IDMapEntry, ...]:

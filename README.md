@@ -5,8 +5,9 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.7 models Unix DAC, POSIX access ACLs, and mount restrictions, not every Linux
-access-control layer.** SELinux, AppArmor, Linux capabilities, user namespaces,
+**v0.8 models Unix DAC, POSIX access ACLs, mount restrictions, and two effective
+DAC capabilities in process mode, not every Linux access-control layer.** SELinux,
+AppArmor, other capability effects, user-namespace translation,
 Docker/container UID/GID mapping, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
 guarantee that a real process can perform it. Reports identify the DAC + ACL + mount
@@ -101,12 +102,13 @@ override filesystem IDs. If an older/incomplete status row supplies real and
 effective IDs but no filesystem ID, the effective ID is an explicitly reported
 fallback; a missing saved ID stays null. Missing real/effective IDs or Groups,
 invalid numbers, duplicate credential fields, or malformed maps are diagnostic
-errors. A filesystem UID of zero uses the existing **traditional privileged root**
-assumption, including the non-directory execute-bit rule.
+errors. In process mode, filesystem UID zero has **no implicit privilege**:
+the observed effective capability set determines DAC/ACL bypasses. Account modes
+retain their traditional privileged-root assumption.
 
-This is still a limited access model. Effective capabilities (`CapEff`) are
-observed, not evaluated. UID zero does not prove actual privilege, and a nonzero
-UID can have capabilities not represented by this model. LSM policy, inode flags,
+This is still a limited access model. Effective capabilities (`CapEff`) supply
+the CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH checks described below. A nonzero
+UID can have these bypasses too. LSM policy, inode flags,
 idmapped mounts, and filesystem-specific authorization remain unmodeled.
 
 **Paths are absolute paths in the debugger's root and mount namespace.** Relative
@@ -120,12 +122,13 @@ No `nsenter`, `setns`, chroot, or host/container path guessing occurs.
 Process-sensitive magic paths such as `/proc/self` retain the debugger's meaning;
 they are not translated into the inspected process's view.
 
-UID/GID maps are parsed and reported as observations, not applied to authorization.
+UID/GID maps are parsed and reported; they are never used to translate inode IDs.
 In a different user namespace the command conservatively stops even if a mapping
 looks simple. A map that cannot be read due to permissions is recorded as unknown;
 equal namespace identifiers still establish that no cross-namespace translation
-is being attempted. Missing proc metadata or a process disappearing during the
-snapshot produces an error.
+is being attempted. A capability bypass additionally requires full identity maps;
+unknown or non-identity maps make a needed bypass indeterminate. Missing proc
+metadata or a process disappearing during the snapshot produces an error.
 
 The collector checks `/proc/PID/stat` start time to detect PID reuse and rereads
 credentials during collection. After permission analysis, it collects the process
@@ -138,7 +141,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v0.7 | PROCESS DIAGNOSE
+PERMISSION HELL v0.8 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -172,7 +175,7 @@ PID 1842 has a different mount namespace from the debugger; foreign namespaces/r
 ```
 
 `--verbose` includes full inode detail, process start time, observed maps and
-CapEff. `--json` includes that structured information without changing format
+all five capability sets. `--json` includes that structured information without changing format
 when verbose is supplied. There is **no process `--suggest-fixes` option**; it is
 rejected by argparse. No process-credential changes or account-based remediation
 commands are inferred from a PID. Account remediation remains unchanged.
@@ -191,7 +194,9 @@ uses `verdict: "indeterminate"`; account-mode error verdicts are unchanged.
 their `filesystem` or `effective_fallback` source plus supplementary GIDs.
 `namespaces` and `root` expose identifiers, comparisons and inspection errors.
 Maps are arrays of `{inside, outside, length}` with
-`maps_used_for_authorization: false`; capabilities are similarly marked unused.
+`maps_used_for_authorization: false` (no ID translation). The capability layer
+checks identity-map eligibility, and `capabilities_used_for_authorization` marks
+whether effective capabilities participate in the process model.
 Unknown names or observations are null. On a context limitation, access-path
 observations are empty and no target or mount permission verdict is fabricated.
 
@@ -205,6 +210,105 @@ Credential semantics follow Linux [proc_pid_status(5)](https://man7.org/linux/ma
 and [credentials(7)](https://man7.org/linux/man-pages/man7/credentials.7.html).
 Root and namespace observations follow [proc_pid_root(5)](https://man7.org/linux/man-pages/man5/proc_pid_root.5.html)
 and [namespaces(7)](https://man7.org/linux/man-pages/man7/namespaces.7.html).
+
+## Capability-aware process checks (v0.8)
+
+The existing `process TARGET --pid PID` command now uses capabilities; no new flag
+or privileged helper is required. `capabilities.py` owns parsing and bypass rules.
+The filesystem walker still makes one ordinary DAC/ACL decision for each parent
+and target, then applies the capability layer before continuing traversal.
+The final verdict engine applies the same mount restrictions as before.
+
+Only **CapEff** can authorize an override. CapInh, CapPrm, CapBnd, and CapAmb are
+retained for explanation, not treated as active permission grants. Names and bit
+positions follow Linux's UAPI capability numbering through bit 40,
+CAP_CHECKPOINT_RESTORE (Linux 5.9). Later kernel bits are preserved as numeric bit
+positions with their hex masks; they are not silently interpreted as known
+capabilities. Missing sets are null/unavailable, distinct from an empty set.
+Malformed hexadecimal fields or duplicate capability fields are errors.
+
+The current modeled operations have these rules:
+
+| Capability | Modeled effect after ordinary DAC/ACL denial |
+| --- | --- |
+| CAP_DAC_OVERRIDE (bit 1) | Bypasses read/write and directory search denial. Non-directory execution still requires at least one execute bit on the inode. |
+| CAP_DAC_READ_SEARCH (bit 2) | Bypasses file read and directory read/search denial. Does not grant write or non-directory execution. |
+| CAP_FOWNER, CAP_CHOWN, CAP_FSETID | Reported when present, but do not grant these r/w/x checks. Ownership changes, sticky-directory deletion, mode/ACL changes and set-ID retention are not modeled operations. |
+
+When both DAC capabilities can authorize the request, READ_SEARCH is selected
+first, following Linux generic_permission's order. Neither capability bypasses
+the modeled read-only or noexec mount restriction. ACL masks and named-user/group
+selection still determine the ordinary result; an applied capability changes the
+effective result without replacing that ordinary decision or granting fake mode
+bits. The original ACL entries/mask remain available in output.
+
+Illustrative WRITE after a named-user ACL mask removed write:
+
+```text
+CAPABILITIES
+  Effective: CAP_DAC_OVERRIDE
+  Relevant modeled effective: CAP_DAC_OVERRIDE
+
+RESULT: PERMITTED
+  '/srv/data/file'  PASS WRITE | CAPABILITY CAP_DAC_OVERRIDE [base ACL USER r--]
+    Base ACL NAMED USER: user:33:rw-. Mask: r--; effective: r--. The ACL mask removes WRITE; access denied, no fallback.
+    DAC/ACL would DENY; capability override: CAP_DAC_OVERRIDE
+    CAP_DAC_OVERRIDE bypasses the ordinary DAC/ACL denial. Effective result: PASS.
+```
+
+Other examples, assuming ordinary denial and supported context:
+
+```text
+CAP_DAC_READ_SEARCH + READ  -> PERMITTED (READ/SEARCH only)
+CAP_DAC_READ_SEARCH + WRITE -> DENIED
+CAP_DAC_OVERRIDE + WRITE on read-only mount -> DENIED (mount blocker)
+CAP_DAC_OVERRIDE + EXECUTE on noexec mount  -> DENIED (mount blocker)
+fsuid=0, CapEff=0, ordinary bits deny       -> DENIED (no UID-0 shortcut)
+```
+
+**Account root versus process root:** `diagnose --as root` and account audits keep
+the traditional privileged-root model. `process --pid PID` inspects actual
+effective capabilities, including for fsuid zero. A root process without relevant
+capabilities can still pass ordinary owner/group/other or ACL checks, but cannot
+bypass a denial merely because its UID is zero. Account remediation is unchanged;
+the process API continues to produce no concrete remediation commands.
+
+**Conservative boundaries:** a foreign/unknown user or mount namespace or root
+still stops evaluation. Even within a shared user namespace, a needed capability
+bypass is indeterminate unless both observed UID/GID maps are the full identity
+range (inside=outside=0, length=4294967295). No namespace translation is attempted.
+An unavailable CapEff, or unknown effective bits with no known applicable bypass,
+also makes an ordinary denial indeterminate. Ordinary allows remain allows without
+needing a capability; a known applicable bypass can still resolve a denial even
+if unrelated unknown bits are present. Unknown bits in inactive sets are reported
+without acting as effective grants. Unknown ACL/metadata errors are not treated
+as ordinary denials that a capability can automatically bypass.
+
+JSON remains schema 1 with additive capability fields under `process.capabilities`:
+`effective`, `permitted`, `inheritable`, `bounding`, and `ambient` are arrays of
+canonical names (or null for unobserved sets). `unknown_bits` is the union of
+unknown bit numbers, `unknown_bits_by_set` preserves their sets, `hex_masks`
+preserves every raw mask value, and `modeled_capabilities` identifies the two rules.
+The original raw `process.effective_capabilities` field remains available.
+Process inode decisions add `base_result`, `base_mechanism`, and
+`capability_override: {capability, applied, reason}` while `result` is the effective
+decision. `mechanism: "capability"` identifies applied bypasses. Ordinary ACL
+`result` and permission masks remain unchanged; process UID zero has null
+`root_assumption`. Consumers using process mode should use the tool version to
+distinguish v0.7's former UID-zero assumption from v0.8's actual capability model.
+Existing account-mode JSON meanings and results are unchanged.
+
+The human default shows effective capabilities compactly, relevant modeled names,
+and overrides where applied; `--verbose` shows complete sets and raw masks.
+Snapshots remain non-atomic and the model still excludes LSM policies, idmapped
+mounts, executable file-capability transitions, and filesystem-specific rules.
+**Permission Hell never grants capabilities, never executes setcap, and never
+suggests adding capabilities as a fix.** Tests read current-process masks and use
+deterministic fixtures for privileges; they require no capability mutation.
+
+References: Linux [capabilities(7)](https://man7.org/linux/man-pages/man7/capabilities.7.html),
+the [UAPI capability numbering](https://github.com/torvalds/linux/blob/master/include/uapi/linux/capability.h),
+and [generic_permission](https://github.com/torvalds/linux/blob/master/fs/namei.c).
 
 ## Focused audit explanations (v0.4)
 
@@ -231,7 +335,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.7 | AUDIT EXPLAIN
+PERMISSION HELL v0.8 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -256,7 +360,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.7 | AUDIT EXPLAIN
+PERMISSION HELL v0.8 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -289,9 +393,9 @@ input/path and 3 for incomplete inspection. A known denial remains definitive
 even when mount inspection is unavailable, with that limitation shown.
 
 The canonical version is `permissionhell.__version__`. Package metadata and
-`--version` use its full value (**0.7.0**); all report headings derive their compact
-label (**v0.7**) from it. Nonzero patch versions remain visible (for example,
-`0.7.1` displays as `v0.7.1`). The DAC/ACL/mount permission model is unchanged.
+`--version` use its full value (**0.8.0**); all report headings derive their compact
+label (**v0.8**) from it. Nonzero patch versions remain visible (for example,
+`0.8.1` displays as `v0.8.1`). The account DAC/ACL/mount permission model is unchanged.
 
 ## Informational change suggestions (v0.5)
 
@@ -377,7 +481,7 @@ unchanged identity/metadata state must be verified before manually applying ACLs
 
 `RemediationSuggestion` holds category, title, commands, effect, and caveats.
 `suggest_remediations()` consumes a `Diagnosis` without mutation or extra system
-inspection; a separate renderer formats it. Package/CLI version is **0.7.0**;
+inspection; a separate renderer formats it. Package/CLI version is **0.8.0**;
 all explanation and diagnostic banners use the same canonical version source.
 
 ## JSON output (v0.6, schema 1)
@@ -407,7 +511,7 @@ Common envelope fields:
 | Field | Meaning |
 | --- | --- |
 | `schema_version` | String `"1"`, independent of the tool release |
-| `tool` | `{ "name": "permissionhell", "version": "0.7.0" }` |
+| `tool` | `{ "name": "permissionhell", "version": "0.8.0" }` |
 | `command` | `diagnose`, `audit`, or `process` |
 | `mode` | `diagnose`, `audit`, `explain`, or `process` |
 | `requested_mode` | `r`, `w`, or `x` |
@@ -452,7 +556,7 @@ Small diagnose example, selected fields only:
 ```json
 {
   "schema_version": "1",
-  "tool": {"name": "permissionhell", "version": "0.7.0"},
+  "tool": {"name": "permissionhell", "version": "0.8.0"},
   "command": "diagnose",
   "mode": "diagnose",
   "requested_mode": "r",
@@ -547,7 +651,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.7 | ACCESS AUDIT
+PERMISSION HELL v0.8 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -645,7 +749,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.7 | READ as navidrome (UID 1001)
+PERMISSION HELL v0.8 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -725,7 +829,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.7 | WRITE as www-data (UID 33)
+PERMISSION HELL v0.8 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -808,14 +912,15 @@ inspection fails, and the mount error is shown separately.
 
 ### Root
 
-v0.3 preserves the **traditional privileged root** model for UID 0:
+Account diagnose/audit preserves the **traditional privileged root** model for UID 0:
 read/write and directory search bypass ordinary mode bits and POSIX access ACLs.
 For execution of a non-directory inode, at least one OWNER, GROUP, or OTHER
 execute bit must be present. Mount `ro` and `noexec` restrictions still apply.
 The report leads with `ROOT OVERRIDE` when a check uses that bypass, or `ROOT`
 otherwise, with the ordinary class shown in brackets for context. It explicitly
-states the privileged-root assumption. Dropped capabilities and namespace-restricted root are not
-modeled; UID 0 alone does not establish actual process capabilities.
+states the privileged-root assumption. This account model does not represent
+dropped capabilities. Process mode instead uses observed effective capabilities;
+UID 0 alone does not establish an actual process bypass.
 
 ### Symlink policy
 

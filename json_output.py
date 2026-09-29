@@ -62,17 +62,25 @@ def inode_data(inode: Inode, subject: Subject, stage: str, blocker: bool = False
     groups = [{"gid": gid, "name": names.get(gid),
                "membership": "primary" if gid == subject.primary_gid else "supplementary"} for gid in gids]
     kind = "directory" if stat.S_ISDIR(inode.mode) else "regular_file" if stat.S_ISREG(inode.mode) else "other"
-    return {"kind": "inode", "inode_type": kind, "stage": stage, "path": inode.path,
+    result = {"kind": "inode", "inode_type": kind, "stage": stage, "path": inode.path,
             "result": "permitted" if decision.allowed else "denied", "blocker": blocker,
             "required_permission": permissions(decision.required),
-            "mechanism": "root" if subject.uid == 0 else "posix_acl" if acl else "unix_dac",
+            "mechanism": "capability" if inode.capability_decision and inode.capability_decision.applied else
+                         "root" if subject.uid == 0 and not subject.process_identity else "posix_acl" if acl else "unix_dac",
             "permission_class": decision.permission_class,
             "effective_permissions": permissions(decision.available), "root_override": decision.root_override,
-            "root_assumption": "traditional_privileged_uid_0" if subject.uid == 0 else None,
+            "root_assumption": "traditional_privileged_uid_0" if subject.uid == 0 and not subject.process_identity else None,
             "owner": {"username": inode.owner, "uid": inode.uid}, "group": {"name": inode.group, "gid": inode.gid},
             "mode": {"bits": stat.S_IMODE(inode.mode), "octal": f"{stat.S_IMODE(inode.mode):04o}",
                      "symbolic": stat.filemode(inode.mode)},
             "matched_groups": groups, "acl": acl, "reason": decision.reason}
+    if inode.base_decision:
+        capability = inode.capability_decision
+        result.update({"base_result": "permitted" if inode.base_decision.allowed else "denied",
+                       "base_mechanism": "posix_acl" if acl else "unix_dac",
+                       "capability_override": {"capability": capability.capability, "applied": capability.applied,
+                                               "reason": capability.reason}})
+    return result
 
 
 def diagnosis_data(report: Diagnosis) -> dict:
@@ -176,6 +184,18 @@ def error_document(version: str, command: str, mode: str, path: str, requested_m
     return result
 
 
+def capabilities_data(sets) -> dict:
+    names = ("effective", "permitted", "inheritable", "bounding", "ambient")
+    result = {name: list(getattr(sets, name).names) if getattr(sets, name) is not None else None for name in names}
+    result["unknown_bits"] = sorted({bit for name in names if getattr(sets, name) is not None
+                                     for bit in getattr(sets, name).unknown_bits})
+    result["unknown_bits_by_set"] = {name: list(getattr(sets, name).unknown_bits) if getattr(sets, name) is not None else None
+                                     for name in names}
+    result["hex_masks"] = {name: format(getattr(sets, name).mask, "x") if getattr(sets, name) is not None else None for name in names}
+    result["modeled_capabilities"] = ["CAP_DAC_OVERRIDE", "CAP_DAC_READ_SEARCH"]
+    return result
+
+
 def process_subject_data(process: ProcessSubject) -> dict:
     status = process.status
     def credentials(ids, names):
@@ -200,7 +220,9 @@ def process_subject_data(process: ProcessSubject) -> dict:
                      "debugger_inode": root.debugger_inode, "matches_debugger": root.matches_debugger, "error": root.error},
             "uid_map": mappings(process.uid_map), "gid_map": mappings(process.gid_map),
             "maps_used_for_authorization": False, "effective_capabilities": status.effective_capabilities,
-            "capabilities_used_for_authorization": False, "notes": list(process.notes)}
+            "capabilities": capabilities_data(status.capabilities),
+            "capabilities_used_for_authorization": status.capabilities.effective is not None and not process.limitations,
+            "notes": list(process.notes)}
 
 
 def process_document(report: ProcessDiagnosis, version: str) -> dict:
@@ -213,7 +235,8 @@ def process_document(report: ProcessDiagnosis, version: str) -> dict:
     result.update({"pid": report.pid, "process": process_subject_data(report.process) if report.process else None,
                    "path_context": "debugger_absolute_path_root_and_mount_namespace",
                    "limitations": list(report.limitations),
-                   "model_limitations": ["Capabilities and LSM policies are not evaluated; UID 0 assumes traditional privileged root.",
+                   "model_limitations": ["Only effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH affect r/w/x; LSM policies remain unmodeled.",
+                                         "Live UID 0 has no implicit bypass. Non-identity or unknown namespace maps cannot authorize capability bypasses.",
                                          "Foreign user/mount namespaces and roots are not entered or mapped.",
                                          "Snapshots are not atomic; no guarantee of actual syscall success.",
                                          "Process remediation is not supported."],
