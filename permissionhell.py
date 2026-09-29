@@ -20,7 +20,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 
 def display_version() -> str:
@@ -1420,10 +1420,33 @@ def main(argv: list[str] | None = None) -> int:
     policy_parser.add_argument("policy_file")
     policy_parser.add_argument("--json", action="store_true", help="Emit every comparison and underlying observation as schema 1 JSON")
     policy_parser.add_argument("--verbose", action="store_true", help="Show all comparisons and complete effective-access observations")
+    snapshot_parser = commands.add_parser("snapshot", help="Capture account or process audit state as portable JSON")
+    snapshot_parser.add_argument("target_path", help="Absolute Linux target path; contents are never read")
+    snapshot_parser.add_argument("--mode", choices=OPERATIONS, default="r")
+    snapshot_parser.add_argument("--processes", action="store_true", help="Capture visible processes instead of local accounts")
+    snapshot_parser.add_argument("--output", help="Atomically publish snapshot here; default is JSON stdout")
+    snapshot_parser.add_argument("--force", action="store_true", help="Replace an existing regular output file")
+    snapshot_parser.add_argument("--json", action="store_true", help="Print full snapshot JSON even when --output is used")
+    diff_parser = commands.add_parser("diff", help="Compare two saved snapshots offline")
+    diff_parser.add_argument("before")
+    diff_parser.add_argument("after")
+    diff_parser.add_argument("--json", action="store_true", help="Emit every comparison as schema 1 JSON")
+    diff_parser.add_argument("--verbose", action="store_true", help="Include unchanged subjects and full before/after observations")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
+    if args.command == "snapshot" and args.force and not args.output:
+        parser.error("--force requires --output FILE")
+    if args.command == "snapshot" and args.output == "":
+        parser.error("--output must name a file")
     def emit_error(message: str, code: ExitCode, stage: str = "request") -> None:
+        if args.command in ("snapshot", "diff"):
+            if args.json or args.command == "snapshot" and not args.output:
+                print(json_output.render_json({"schema_version": "1", "command": args.command,
+                      "tool_version": __version__, "exit_code": int(code), "errors": [message]}), end="")
+            else:
+                print(f"permissionhell: {message}", file=sys.stderr)
+            return
         if args.command == "policy-check":
             import policy_drift
             report = policy_drift.DriftReport(args.policy_file, errors=[{
@@ -1466,10 +1489,33 @@ def main(argv: list[str] | None = None) -> int:
             print(json_output.render_json(policy_drift.policy_document(report, __version__)), end="")
         else:
             print(policy_drift.render_policy(report, __version__, verbose=args.verbose))
-    if not sys.platform.startswith("linux"):
+    if not sys.platform.startswith("linux") and args.command != "diff":
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command in ("snapshot", "diff"):
+            import access_snapshot
+            try:
+                if args.command == "snapshot":
+                    snapshot = access_snapshot.capture_snapshot(args.target_path, args.mode, processes=args.processes,
+                                                                 engine=sys.modules[__name__])
+                    if args.output:
+                        access_snapshot.write_snapshot(snapshot, args.output, force=args.force)
+                    if args.json or not args.output:
+                        print(access_snapshot.serialize_snapshot(snapshot), end="")
+                    else:
+                        print(access_snapshot.render_capture(snapshot, args.output))
+                    return snapshot.code
+                comparison = access_snapshot.diff_snapshots(access_snapshot.load_snapshot(args.before),
+                                                            access_snapshot.load_snapshot(args.after))
+                if args.json:
+                    print(json_output.render_json(access_snapshot.diff_document(comparison, __version__)), end="")
+                else:
+                    print(access_snapshot.render_diff(comparison, __version__, verbose=args.verbose))
+                return comparison.code
+            except access_snapshot.SnapshotError as exc:
+                emit_error(str(exc), exc.code)
+                return exc.code
         if args.command == "policy-check":
             import policy_drift
             report = policy_drift.check_policy_file(args.policy_file, engine=sys.modules[__name__])

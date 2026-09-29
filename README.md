@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v1.2 adds intended-policy versus effective-access drift checking and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.3 adds portable access snapshots and offline diffs and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
 process contexts, not every Linux access-control layer.** SELinux,
 AppArmor, other capability effects, foreign mount/root path translation,
@@ -50,6 +50,8 @@ python3 permissionhell.py audit-processes ABSOLUTE_TARGET [--pid PID ...] [--mod
 python3 permissionhell.py graph TARGET --as USERNAME [--mode {r,w,x}] [--verbose] [--json | --dot]
 python3 permissionhell.py graph ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json | --dot]
 python3 permissionhell.py policy-check POLICY_FILE [--verbose] [--json]
+python3 permissionhell.py snapshot ABSOLUTE_TARGET [--mode {r,w,x}] [--processes] [--output FILE] [--force] [--json]
+python3 permissionhell.py diff BEFORE_JSON AFTER_JSON [--verbose] [--json]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -86,6 +88,238 @@ An unprivileged debugger may be unable to read necessary metadata. That produces
 a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
+
+## Access snapshots and offline comparison (v1.3)
+
+```bash
+# Explicit local-account inventory, using the existing account audit:
+permissionhell snapshot /srv/payroll.db --mode r --output before.json
+
+# Capture again after an independently administered change:
+permissionhell snapshot /srv/payroll.db --mode r --output after.json
+permissionhell diff before.json after.json
+permissionhell diff before.json after.json --json
+permissionhell diff before.json after.json --verbose
+
+# Visible processes, including their live identity/capability/namespace context:
+permissionhell snapshot /srv/payroll.db --processes --output processes.json
+
+# Without --output, emit only the complete snapshot JSON to stdout:
+permissionhell snapshot /srv/payroll.db
+```
+
+Capture requires Linux and an absolute debugger-visible target. Account captures
+reuse the `/etc/passwd` account audit; process captures reuse visible `/proc` process
+auditing without requesting command lines. The access engines and existing command
+JSON are unchanged. **Diff is entirely offline and can run on Windows:** it reads
+only the two input snapshot files, never re-inspects their targets or subjects.
+
+Normal file-output acknowledgement is compact:
+
+```text
+PERMISSION HELL v1.3 | SNAPSHOT
+Target: '/srv/payroll.db'
+Mode: r | Scope: accounts
+Subjects captured: 28
+Output: 'before.json'
+Capture: complete
+```
+
+`--json` also prints the full JSON when an output file is requested. `--force`
+requires `--output` and permits replacing an existing regular output file. An
+existing destination is otherwise refused, including when another writer creates
+it between the initial check and publication. Empty paths, missing destination
+directories and attempts to replace the target itself are errors. Force does not
+replace symlinks/directories, and a hard-link alias of the target is refused.
+
+### Snapshot format 1
+
+Snapshot files use their own integer `snapshot_version: 1`, independently of the
+existing command JSON schema. Top-level fields are:
+
+- `tool_version`, UTC ISO-8601 `captured_at` (capture start), `scope` (`accounts` or
+  `processes`), absolute `target`, and `requested_mode` (`r`, `w`, `x`).
+- `system`: hostname, kernel release, architecture, platform, boot ID and the
+  debugger's PID-namespace identifier where available.
+- `target_metadata`: device, inode, owner UID, group GID, octal mode, ACL inspection
+  state and numeric entries, plus mount point/type/options/superblock options.
+- `subjects`: consistently sorted account/process observations.
+- `capture_errors` and `capture_exit_code`: whether the recorded observation is complete.
+
+Each subject contains structured `identity`, display `name`, `verdict`, summarized
+`mechanism`, `blocker`, ordered `authorization` routes, and the full underlying
+audit JSON in `observation`. Account identity is `{uid, username}`; process identity
+is `{pid, start_time_ticks}`, with null start time when a trustworthy snapshot was
+unavailable. Names are labels, not identity substitutes. Authorization routes retain
+selected classes, ACL entry identities, matched groups, root assumptions and applied
+capabilities. Full mode bits, ACL masks and decision reasons remain in the underlying
+observation. Python repr strings are not used as primary snapshot data.
+
+Target metadata is collected separately as the debugger, without new authorization
+rules or target-content reads. ACLs on symlink targets are read from the resolved
+inode. `acl_status` distinguishes `present`, `absent` and `unavailable`; null ACL data
+is never silently called an absent ACL after a failed read. This additional metadata
+inspection may make capture incomplete even when an account's owner/root shortcut
+provided a definitive access decision. Both facts are retained.
+
+Metadata is observed before and after the audit. A detected change marks capture
+incomplete; `target_metadata` contains the final observation and each subject keeps
+its own inode observations. This is not atomic: a change-and-restore race, process
+exit, account/ACL changes or a change after the final read may escape detection.
+The snapshot timestamp is not a claim that every record existed simultaneously.
+
+### Safe file publication
+
+File output is staged in a private temporary file in the destination directory,
+flushed and fsynced before publication. Without force, atomic hard-link publication
+prevents replacing a concurrent writer's file. With force, `os.replace` atomically
+replaces the directory entry. There is no unsafe overwrite fallback if the filesystem
+does not support the publication operation. Temporary staging files are cleaned up
+on ordinary failures/interruption; abrupt termination or power loss may leave a
+private staging file. This prevents partial published JSON, but is not a guarantee
+of directory-entry durability across power loss. New snapshot files have the private
+permissions supplied by `mkstemp`, including when replacing an older output file.
+
+### Identity-safe matching
+
+Accounts match by **UID plus exact username**. A rename, changed UID or possible
+UID reuse produces SUBJECT_REMOVED/SUBJECT_ADDED with a warning, not a guessed access
+gain/loss. Reuse of both the same UID and name cannot be proven from these observations.
+Multiple names sharing a UID remain distinct account records.
+
+Processes match by **PID plus start-time ticks**, only when hostname, boot ID and
+debugger PID-namespace context are known and equal. A reused PID with a new start
+time is removed/added, never treated as the original process changing permissions:
+
+```text
+SUBJECT_REMOVED
+  PID 812 'old-worker' (start 12345)
+SUBJECT_ADDED
+  PID 812 'new-worker' (start 98765)
+```
+
+Known different hosts, boots or PID namespaces make process identities distinct.
+Missing start times or identity context prevent safe matching and make comparison
+incomplete; PID alone is never used as a fallback. Even comparing an unavailable
+PID record to itself cannot establish continuity. A process with a retained start
+time but an uncertain namespace/access result can still be matched and classified
+as BECAME_INDETERMINATE or RESOLVED_FROM_INDETERMINATE.
+
+Different hosts produce a warning. Account UID/name comparisons still proceed as
+contextual comparisons, not proof of a shared account identity. Tool-version changes
+also warn because the modeled security layers may differ. Hostnames, boot IDs and
+namespace identifiers are observations, not authenticated global identity guarantees.
+
+### Diff categories and explanations
+
+```text
+GAINED_ACCESS
+  'www-data' (UID 33)
+    before: DENIED via OTHER
+    after: PERMITTED via ACL named_user
+
+LOST_ACCESS
+  'backup' (UID 34)
+    before: PERMITTED via GROUP
+    after: DENIED via OTHER
+    blocker: '/srv/private' (traversal)
+
+MECHANISM_CHANGED
+  PID 812 'backupd' (start 12345)
+    before: PERMITTED via ACL named_user
+    after: PERMITTED via CAP_DAC_OVERRIDE
+    Access remains PERMITTED
+
+TARGET METADATA CHANGES (observed together; causality is not assumed)
+  mode: '0640' -> '0644'
+  acl: changed
+```
+
+The primary per-subject category is GAINED_ACCESS, LOST_ACCESS, UNCHANGED_PERMITTED,
+UNCHANGED_DENIED, BECAME_INDETERMINATE, RESOLVED_FROM_INDETERMINATE, SUBJECT_ADDED,
+SUBJECT_REMOVED or UNCHANGED_INDETERMINATE. Unknown/error/unavailable observations
+are not coerced to denied. A resolved unknown is not called a gain without evidence
+that access was previously denied.
+
+For unchanged permitted/denied access, `mechanism_changed` additionally compares the
+structured authorization routes and blocker: selected classes, ACL entry identities,
+matched groups and applied capabilities. It does not compare prose or label a newly
+added, unused permission bit as a different mechanism. Target ACL/mode changes are
+reported independently. Denial routes/blockers can also change while access remains
+denied. Thus unchanged-access and mechanism-change summary counts can overlap.
+
+Subject context changes (names, credentials, mappings, namespaces or capability
+observations) are retained separately as `context_changes` and shown as
+SUBJECT_METADATA_CHANGED when access is otherwise unchanged. Target metadata changes
+are compared independently, with a prominent TARGET_CHANGED warning for device/inode
+differences. Identical paths do not establish identical objects; metadata observed
+at the same time as access changes is supporting evidence, not automatic proof of
+causality. Timestamp/tool-version differences alone are not meaningful changes.
+
+Default output hides unchanged subjects unless their mechanism/context changed,
+while retaining counts. `--verbose` includes every subject, complete before/after
+observations and full metadata changes. Error/unknown snapshots still expose known
+changes alongside warnings about incomplete comparison.
+
+### JSON diff and validation
+
+`diff --json` emits schema **1**, `command: "diff"`, before/after capture headers,
+`target_changes`, `summary`, `warnings`, `exit_code` and every individual comparison
+in `changes`. No display grouping is applied. Example excerpt:
+
+```json
+{
+  "subject_type": "account",
+  "subject": {"uid": 33, "username": "www-data"},
+  "change": "gained_access",
+  "mechanism_changed": false,
+  "context_changes": {}
+}
+```
+
+Complete change records also contain the full `before` and `after` snapshot subject
+records (null on the absent side). Target changes have `{before, after}` values;
+summary counts distinguish subject/access/mechanism/context and target changes.
+`target_changed` counts any target metadata change; `target_identity_changed` counts
+device/inode changes specifically.
+
+Malformed JSON, duplicate object keys, non-finite numbers, unsupported format
+versions, missing fields, invalid identities and conflicting record identities are
+rejected cleanly. Cross-scope, cross-mode and cross-target-path comparisons are
+rejected; no implicit override or target normalization is applied. Snapshot files
+are not cryptographically signed or tamper-proof.
+
+| Command | 0 | 1 | 2 | 3 |
+| --- | --- | --- | --- | --- |
+| snapshot | Complete capture emitted/saved | Not used; denials are data | Invalid target/output request or existing file without force | Partial capture or output/system failure |
+| diff | Comparable observations, no meaningful changes | Meaningful access/identity/mechanism/context/target metadata changes | Invalid, unreadable or incompatible input files | Incomplete captures or unresolved identity prevent a fully definitive comparison |
+
+An incomplete capture is still serialized/saved when output succeeds. It returns
+3 if any subject is unknown/unavailable, required target metadata is unavailable,
+or collection detected errors/races. Even normal process exits remain visible as
+incomplete snapshot observations. Diff returns 3 in preference to 1 when either
+capture is incomplete or identity matching is unresolved, including when some known
+changes or resolutions are reportable. Initial unresolved targets return 2 without
+publishing a snapshot. Snapshot-write failures do not leave partial published files.
+
+### Privacy, safety and deferred work
+
+Snapshots contain sensitive inventory: paths, accounts/IDs/groups, PIDs/names,
+namespace and boot IDs, capabilities, ACL identities and host details. Store and
+share them accordingly. Capture does not include target contents, process memory,
+environment variables or full command lines. No reports are uploaded externally.
+
+Runtime capture does not change targets, permissions, ACLs, ownership, processes,
+namespaces, mappings, capabilities, mounts or security settings. Its only intentional
+filesystem write is the explicitly requested snapshot output, using temporary staging
+in that directory. With no `--output`, it writes JSON only to stdout. Normal Python
+bytecode caching can be suppressed with `python3 -B`, as with other commands.
+Tests change permissions only on their own temporary fixtures.
+
+Scheduled capture, compressed storage, signed snapshots, cross-target/mode overrides,
+persistent account/service identity, graph/policy overlays and a full traversal-inode
+metadata diff are deferred. Process visibility and all existing access-model limits
+remain; snapshots preserve modeled observations, not a kernel authorization trace.
 
 ## Intended-policy versus effective-access drift (v1.2)
 
@@ -220,7 +454,7 @@ was allowed; v1.2 reports the observed mechanism but does not invent mechanism d
 Illustrative shortened output:
 
 ```text
-PERMISSION HELL v1.2 | POLICY CHECK
+PERMISSION HELL v1.3 | POLICY CHECK
 Policy: 'policy.json'
 
 '/srv/payroll.db' | READ
@@ -530,7 +764,7 @@ deferred to avoid an additional, potentially inconsistent identity snapshot.
 Illustrative shortened output (names and PIDs are examples):
 
 ```text
-PERMISSION HELL v1.2 | PROCESS AUDIT
+PERMISSION HELL v1.3 | PROCESS AUDIT
 Target: '/srv/private/secrets.db'
 Requested: READ
 
@@ -683,7 +917,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v1.2 | PROCESS DIAGNOSE
+PERMISSION HELL v1.3 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -954,7 +1188,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v1.2 | AUDIT EXPLAIN
+PERMISSION HELL v1.3 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -979,7 +1213,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v1.2 | AUDIT EXPLAIN
+PERMISSION HELL v1.3 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -1270,7 +1504,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v1.2 | ACCESS AUDIT
+PERMISSION HELL v1.3 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -1368,7 +1602,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v1.2 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.3 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1448,7 +1682,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v1.2 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.3 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1622,6 +1856,7 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | Process inventory and access audit | `audit_processes()` / `ProcessAuditResult`, `ProcessAuditEntry`, `ProcessAuditSummary` in `process_audit.py` |
 | Access graph model and exports | `AccessGraph`, `GraphNode`, `GraphEdge`, graph builders and terminal/JSON/DOT serializers in `access_graph.py` |
 | Intended policy and drift | Policy parsing, `evaluate_policy()`, `DriftResult` and `DriftSummary` in `policy_drift.py` |
+| Snapshots and offline diff | `AccessSnapshot`, `SnapshotSubject`, `SnapshotDiff`, capture/validation/publication/renderer functions in `access_snapshot.py` |
 | Permission engine | `evaluate_permission()` / `PermissionDecision` |
 | ACL inspection and selection | `read_access_acl()`, `evaluate_acl()` / `AccessACL`, `ACLMatch` |
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
@@ -1667,6 +1902,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Process-audit UID/name filtering with explicit snapshot semantics.
 - Process-audit summary graphs and optional interactive graph views.
 - Explicit mechanism constraints, process identity pins and policy graph overlays.
+- Snapshot graph/policy overlays, signed storage and richer traversal metadata diffs.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Establishing capability scope in foreign user namespaces.
