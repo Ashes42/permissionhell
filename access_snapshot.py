@@ -392,6 +392,7 @@ def _context(subject: SnapshotSubject) -> dict:
     observation = subject.observation
     process = observation.get("process")
     return {"name": subject.name, "credentials": observation.get("subject"),
+            "lsm": observation.get("lsm"), "lsm_result": observation.get("lsm_result"),
             "process": {key: value for key, value in process.items() if key not in ("pid", "start_time_ticks", "name")}
                        if isinstance(process, dict) else None}
 

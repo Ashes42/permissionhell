@@ -257,6 +257,7 @@ def process_subject_data(process: ProcessSubject) -> dict:
 
 
 def process_document(report: ProcessDiagnosis, version: str) -> dict:
+    import lsm
     result = envelope(version, "process", "process", report.requested_path, report.mode)
     if report.diagnosis:
         result.update(diagnosis_data(report.diagnosis))
@@ -275,6 +276,14 @@ def process_document(report: ProcessDiagnosis, version: str) -> dict:
                                          "Process remediation is not supported."],
                    "verdict": "indeterminate" if report.code == 3 else VERDICTS[report.code], "exit_code": int(report.code)})
     result["errors"].extend(error_data(message, report.code, "process") for message in report.limitations)
+    result["lsm"] = lsm.document(report.lsm) if report.lsm else None
+    result["lsm_result"] = lsm.decision_document(report.lsm_result) if report.lsm_result else None
+    result["ordinary_verdict"] = VERDICTS[report.diagnosis.code] if report.diagnosis else None
+    if report.lsm_result:
+        result["reasons"].extend(report.lsm_result.reasons)
+        if report.lsm_result.status == "error":
+            result["verdict"] = "error"
+            result["errors"].extend(error_data(reason, report.code, "lsm") for reason in report.lsm_result.reasons)
     return result
 
 

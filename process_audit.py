@@ -91,7 +91,7 @@ def classify(report: ProcessDiagnosis) -> ProcessAuditEntry:
     if report.code == 2:
         return ProcessAuditEntry(report.pid, "error", report, reason)
     uncertain = {"path_context_unresolved", "uid_mapping_unresolved", "group_mapping_unresolved",
-                 "capability_scope_unestablished", "capability_unknown"}
+                 "capability_scope_unestablished", "capability_unknown", "lsm_policy_unresolved"}
     return ProcessAuditEntry(report.pid, "indeterminate" if report.indeterminate_reason in uncertain else "error", report, reason,
                              reason_code=report.indeterminate_reason)
 
@@ -187,6 +187,11 @@ def entry_lines(entry: ProcessAuditEntry, engine) -> list[str]:
                 lines.extend(diagnosis.reasons[2:])  # Subsequent mount restrictions from the verdict engine.
         else:
             lines.extend(engine.concise_reasons(diagnosis))
+    if report.lsm:
+        import lsm
+        lines.extend(lsm.summary_lines(report.lsm))
+        if report.lsm_result:
+            lines.extend(report.lsm_result.reasons)
     return list(dict.fromkeys(lines))
 
 

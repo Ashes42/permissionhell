@@ -154,6 +154,16 @@ def build_graph(data: dict) -> AccessGraph:
             options += ", noexec"
         graph.append(GraphNode("mount:target", "mount", f"Mount {mount['mount_point']!r}: {options}",
                                RESULT_STATUS[mount["result"]], mount), "constrained_by")
+    if data.get("lsm"):
+        security = data["lsm"]
+        decision = data.get("lsm_result") or {"status": "not_evaluated", "reason": "LSM decision not evaluated."}
+        aa, se = security["apparmor"], security["selinux"]
+        label = (f"AppArmor {aa['profile']!r} ({aa['mode'] or 'unknown'}); SELinux " +
+                 {True: "enforcing", False: "permissive", None: "unknown/inactive"}[se['enforcing']] +
+                 ": " + decision["reason"])
+        graph.append(GraphNode("lsm:policy", "lsm", label,
+                               decision["status"] if decision["status"] in ("indeterminate", "error") else "neutral",
+                               {"lsm": security, "lsm_result": decision}), "constrained_by")
     if data.get("errors") or data.get("limitations"):
         status = "indeterminate" if graph.result == "indeterminate" else "error"
         reasons = data.get("limitations") or [error["message"] for error in data["errors"]]

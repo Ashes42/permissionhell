@@ -5,14 +5,139 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v1.3 adds portable access snapshots and offline diffs and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.4 adds Linux Security Module awareness and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
-process contexts, not every Linux access-control layer.** SELinux,
-AppArmor, other capability effects, foreign mount/root path translation,
+process contexts, not every Linux access-control layer.** SELinux and AppArmor
+state and context are inspected, but their full policies, other capability effects, foreign mount/root path translation,
 container orchestration, and NFS/SMB/CIFS/FUSE-specific behavior are not
 modeled. A permitted result means this model permits the request; it is not a
 guarantee that a real process can perform it. Reports identify the DAC + ACL + mount
 model; `--verbose` and `--help` include the full scope and limitations.
+
+## Linux Security Module awareness (v1.4)
+
+Linux Security Modules (LSMs) add authorization checks beyond ordinary file
+permissions. A successful DAC/ACL/capability/mount check does not prove that an
+enforcing AppArmor or SELinux policy allows the operation. Permission Hell now
+observes those layers without attempting to simulate their policies.
+
+```bash
+python3 permissionhell.py process /srv/data.db --pid 812
+python3 permissionhell.py process /srv/data.db --pid 812 --json
+python3 permissionhell.py audit-processes /srv/data.db
+python3 permissionhell.py graph /srv/data.db --pid 812
+```
+
+The process evaluator retains its **ordinary verdict** and adds an independent
+LSM observation and decision:
+
+| Ordinary result | LSM observation | Final modeled result |
+| --- | --- | --- |
+| DENIED | Any state, including unknown | DENIED (1) |
+| PERMITTED | Supported LSMs inactive | PERMITTED (0) |
+| PERMITTED | AppArmor unconfined | PERMITTED (0), subject to other layers |
+| PERMITTED | AppArmor complain | PERMITTED (0), informational in this model |
+| PERMITTED | AppArmor enforce/confined or unfamiliar mode | INDETERMINATE (3) |
+| PERMITTED | SELinux permissive | PERMITTED (0), policy denials are not enforced |
+| PERMITTED | SELinux enforcing | INDETERMINATE (3) |
+| PERMITTED | Relevant activity, enforcement or profile unavailable | INDETERMINATE (3) |
+| PERMITTED | Malformed required LSM metadata | ERROR (3) |
+
+These rows combine: AppArmor unconfined does not cancel SELinux enforcing, and
+SELinux permissive does not cancel AppArmor enforce. Capability overrides never
+bypass this LSM confidence check. Known DAC or mount denials remain denials.
+Missing SELinux labels do not invent a denial or bypass enforcement uncertainty.
+When SELinux is permissive, unavailable or malformed descriptive labels do not
+invalidate an otherwise established permit.
+
+Detection uses `/sys/kernel/security/lsm`,
+`/sys/module/apparmor/parameters/enabled`, `/sys/fs/selinux/enforce`,
+per-module `/proc/PID/attr/{apparmor,selinux}/current` and, when attribution is
+unambiguous, the legacy `/proc/PID/attr/current`. No external status commands are
+required. Missing sources remain **unavailable**, not silently inactive; a hidden
+or unmounted selinuxfs is not evidence that SELinux is disabled. On kernels such
+as WSL, the SELinux initial `kernel` context indicates that the initial policy
+has not been loaded. This is reported separately from permissive or disabled.
+The full active list is retained when readable, even with stacked LSMs.
+
+AppArmor profile names and `enforce`, `complain`, and `unconfined` states are
+reported explicitly. Unfamiliar or stacked profile syntax stays conservative.
+AppArmor is path/profile oriented; no AppArmor inode label is invented. SELinux
+process contexts and the target's `security.selinux` xattr are read when available.
+An absent xattr, unsupported filesystem and permission-denied read are distinct
+observations. No labels are changed.
+
+Yama, lockdown and capability are not treated as generic file-access blockers.
+Active Smack, TOMOYO, BPF LSM and IPE are reported as potentially relevant but
+unevaluated. Unrecognized names are listed without guessing their behavior.
+**Landlock is only listed as available: per-task rulesets are not detected or
+modeled.** Thus PERMITTED remains a modeled result, not a syscall guarantee.
+
+`diagnose --as USER` and account audits retain their traditional account-level
+DAC/ACL model. An account has no single process security context; no profile is
+invented and system LSM presence does not change account-mode results.
+
+Process audits evaluate LSM context separately for each PID. One inaccessible
+profile does not abort the inventory; an unresolved permit is counted as
+indeterminate and makes the audit incomplete (exit 3). Policy checks inherit this
+uncertainty, so an expected allow cannot become MATCH merely because DAC permits
+it. Expected deny still matches an established ordinary denial. Process graphs
+add an LSM node after ordinary checks, including context and uncertainty, in
+terminal, JSON and DOT formats.
+
+Process JSON schema 1 gains additive `ordinary_verdict`, `lsm` and `lsm_result`
+fields. For example (excerpt):
+
+```json
+{
+  "ordinary_verdict": "permitted",
+  "verdict": "indeterminate",
+  "exit_code": 3,
+  "lsm": {
+    "active": ["apparmor"],
+    "active_status": "available",
+    "apparmor": {"enabled": true, "profile": "usr.sbin.nginx", "mode": "enforce", "error": null},
+    "selinux": {"enabled": false, "enforcing": null, "process_context": null, "target_context": null}
+  },
+  "lsm_result": {
+    "status": "indeterminate",
+    "reason": "AppArmor profile is active but policy rules are not evaluated. SELinux inactive."
+  }
+}
+```
+
+Observations also include inspection errors, target-label status and SELinux
+policy-loaded state. LSM decision status is `resolved`, `indeterminate`, `error`
+or `not_required` when the ordinary layer has not permitted access. An unresolved
+policy decision is not mislabeled as an inspection error. Old constructed process
+records without LSM observations retain `null` additive fields; live CLI inspection
+always collects LSM state.
+
+Process snapshots retain the same structured metadata. Offline diffs report
+profile, context, enforcement and LSM-decision changes as context changes; they do
+not re-read live policy. An enforcing-policy transition can become
+`became_indeterminate`, rather than inventing lost access. Snapshot format 1 and
+older snapshots remain readable. As before, any incomplete capture makes its diff
+incomplete (3), even when useful context changes are reported.
+
+**Privacy:** profiles and security labels may reveal application names and policy
+structure. They appear in process reports, exported JSON, graphs and snapshots;
+share these artifacts accordingly. No command lines are newly collected.
+
+**Read-only:** LSM inspection reads kernel metadata only. It does not change any
+policy, profile, label, xattr, target file, process, namespace, capability, mount or
+security setting. Existing explicit snapshot output files remain the sole
+application-data write feature; normal Python bytecode-cache behavior is unchanged.
+
+Deferred: full AppArmor rules/includes/transition evaluation, SELinux policy/AVC
+queries and per-domain permissive analysis, denial-log correlation, Landlock
+rulesets, and policy simulation for other LSMs. Complain mode is informational in
+this model; it is not a full simulation of explicit AppArmor deny rules. Profile
+or policy changes can race observation; process state is rechecked around the
+walk, but no atomic kernel authorization snapshot or syscall probe is claimed.
+
+Interface references: the kernel's [LSM userspace API](https://www.kernel.org/doc/html/latest/userspace-api/lsm.html)
+and [SELinux context implementation](https://github.com/torvalds/linux/blob/master/security/selinux/ss/services.c).
 
 ## Installation
 
@@ -117,7 +242,7 @@ only the two input snapshot files, never re-inspects their targets or subjects.
 Normal file-output acknowledgement is compact:
 
 ```text
-PERMISSION HELL v1.3 | SNAPSHOT
+PERMISSION HELL v1.4 | SNAPSHOT
 Target: '/srv/payroll.db'
 Mode: r | Scope: accounts
 Subjects captured: 28
@@ -454,7 +579,7 @@ was allowed; v1.2 reports the observed mechanism but does not invent mechanism d
 Illustrative shortened output:
 
 ```text
-PERMISSION HELL v1.3 | POLICY CHECK
+PERMISSION HELL v1.4 | POLICY CHECK
 Policy: 'policy.json'
 
 '/srv/payroll.db' | READ
@@ -764,7 +889,7 @@ deferred to avoid an additional, potentially inconsistent identity snapshot.
 Illustrative shortened output (names and PIDs are examples):
 
 ```text
-PERMISSION HELL v1.3 | PROCESS AUDIT
+PERMISSION HELL v1.4 | PROCESS AUDIT
 Target: '/srv/private/secrets.db'
 Requested: READ
 
@@ -917,7 +1042,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v1.3 | PROCESS DIAGNOSE
+PERMISSION HELL v1.4 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -1188,7 +1313,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v1.3 | AUDIT EXPLAIN
+PERMISSION HELL v1.4 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -1213,7 +1338,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v1.3 | AUDIT EXPLAIN
+PERMISSION HELL v1.4 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -1504,7 +1629,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v1.3 | ACCESS AUDIT
+PERMISSION HELL v1.4 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -1602,7 +1727,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v1.3 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.4 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1682,7 +1807,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v1.3 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.4 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1904,7 +2029,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 - Explicit mechanism constraints, process identity pins and policy graph overlays.
 - Snapshot graph/policy overlays, signed storage and richer traversal metadata diffs.
 - Default-ACL inheritance and richer ACL inspection output.
-- SELinux and AppArmor context and policy diagnostics.
+- Full SELinux and AppArmor policy evaluation and denial-log correlation.
 - Establishing capability scope in foreign user namespaces.
 - Foreign mount/root path contexts, idmapped mounts and filesystem-specific behavior.
 

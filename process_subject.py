@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import os
 from pathlib import Path
 import re
+import lsm
 from capabilities import ProcessCapabilities, CapabilityError, STATUS_FIELDS, parse_capability_fields
 from idmap import IDMap, IDMapEntry, IDMapError
 
@@ -85,6 +86,7 @@ class ProcessSubject:
     setgroups: str = "unavailable"
     overflow_uid: int | None = None
     overflow_gid: int | None = None
+    lsm: lsm.LSMState | None = None
 
     @property
     def limitations(self) -> tuple[str, ...]:
@@ -238,11 +240,12 @@ def inspect_process(pid: int) -> ProcessSubject:
                            *status.supplementary_gids) if v is not None}
         uid_names = {uid: identity_name(uid) for uid in sorted(uids)}
         gid_names = {gid: identity_name(gid, group=True) for gid in sorted(gids)}
+        security = lsm.inspect_process(pid)
         if start_time(pid) != started or parse_status(read_text(f"/proc/{pid}/status")) != status:
             raise ProcessInspectionError(f"PID {pid} changed identity or credentials during inspection; retry",
                                          kind="identity_changed")
         return ProcessSubject(pid, started, status, uid_names, gid_names, mount_ns, user_ns, root,
-                              maps[0], maps[1], tuple(notes), setgroups, overflow_uid, overflow_gid)
+                              maps[0], maps[1], tuple(notes), setgroups, overflow_uid, overflow_gid, security)
     except OSError as exc:
         kind = "proc_permission" if isinstance(exc, PermissionError) else "inspection_error"
         if isinstance(exc, FileNotFoundError):

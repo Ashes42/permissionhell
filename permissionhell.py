@@ -16,11 +16,12 @@ import stat
 import sys
 
 import json_output
+import lsm
 from process_subject import ProcessSubject, ProcessInspectionError, inspect_process
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 
 def display_version() -> str:
@@ -573,6 +574,8 @@ class ProcessDiagnosis:
     namespace_identity: NamespaceIdentity | None = None
     indeterminate_reason: str | None = None
     inspection_kind: str | None = None
+    lsm: lsm.LSMState | None = None
+    lsm_result: lsm.LSMDecision | None = None
 
 
 def process_filesystem_subject(process: ProcessSubject) -> Subject:
@@ -604,12 +607,15 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
         return report
     try:
         report.process = inspect_process(pid)
+        report.lsm = report.process.lsm
         report.namespace_identity = namespace_identity(report.process)
         report.limitations.extend(report.process.limitations)
         if report.limitations:
             report.indeterminate_reason = "path_context_unresolved"
             return report
         diagnosis = diagnose(path, process_filesystem_subject(report.process), mode)
+        if report.lsm is not None and diagnosis.trace.target is not None:
+            report.lsm = lsm.inspect_target(report.lsm, diagnosis.trace.target.path)
         # Recheck identity, credentials, root and namespaces after the path walk.
         # A changed/exited/reused PID must not inherit the earlier observation's verdict.
         try:
@@ -621,6 +627,12 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
             raise ProcessInspectionError(f"PID {pid} identity, credentials, or context changed during analysis; retry",
                                          kind="identity_changed")
         report.diagnosis, report.code = diagnosis, diagnosis.code
+        if report.lsm is not None:
+            report.lsm_result = lsm.evaluate(report.lsm, diagnosis.code)
+            if report.lsm_result.status in ("indeterminate", "error"):
+                report.code = ExitCode.ERROR
+                report.indeterminate_reason = ("lsm_policy_unresolved" if report.lsm_result.status == "indeterminate"
+                                               else "lsm_inspection_error")
         if diagnosis.code == ExitCode.ERROR:
             report.indeterminate_reason = diagnosis.trace.error_kind or "diagnostic_error"
     except (ProcessInspectionError, DiagnosticError, OSError, IDMapError) as exc:
@@ -1216,6 +1228,14 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
                                               if observed is not None else "unavailable"))
     result = {ExitCode.ALLOWED: "PERMITTED", ExitCode.DENIED: "DENIED",
               ExitCode.INPUT: "INVALID INPUT / UNRESOLVED PATH", ExitCode.ERROR: "INDETERMINATE"}[report.code]
+    if report.lsm_result and report.lsm_result.status == "error":
+        result = "ERROR"
+    if report.lsm is not None:
+        lines.extend(["", "LSM", *("  " + line for line in lsm.summary_lines(report.lsm))])
+        if verbose:
+            lines.extend("  Observation: " + repr(error) for error in report.lsm.errors)
+            lines.extend("  Observation: " + repr(error) for error in
+                         (report.lsm.apparmor.error, report.lsm.selinux.error) if error)
     lines.extend(["", f"RESULT: {result}"])
     if report.diagnosis:
         process_scope = ("Scope: live process fsuid/fsgid/groups, effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH; "
@@ -1223,6 +1243,11 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
         lines.extend(["", "ACCESS PATH", *explanation_detail_lines(report.diagnosis, verbose, scope_text=process_scope)])
     else:
         lines.extend(["", "WHY", *report.limitations])
+    if report.lsm_result:
+        lines.extend(["", "LSM DECISION",
+                      "  Ordinary DAC/ACL, capability and mount result: " +
+                      ("PERMITTED" if report.diagnosis and report.diagnosis.code == 0 else "not permitted"),
+                      *("  " + reason for reason in report.lsm_result.reasons)])
     lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL + effective DAC capabilities + mount restrictions.",
                   "LSM policies, other capability effects, foreign capability scope and mount/root translation remain unmodeled.",
                   "Process snapshots are not atomic. Process remediation commands are not supported."])
