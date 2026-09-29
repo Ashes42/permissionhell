@@ -20,7 +20,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "0.9.0"
+__version__ = "1.0.0"
 
 
 def display_version() -> str:
@@ -572,6 +572,7 @@ class ProcessDiagnosis:
     code: ExitCode = ExitCode.ERROR
     namespace_identity: NamespaceIdentity | None = None
     indeterminate_reason: str | None = None
+    inspection_kind: str | None = None
 
 
 def process_filesystem_subject(process: ProcessSubject) -> Subject:
@@ -614,17 +615,20 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
         try:
             after = inspect_process(pid)
         except ProcessInspectionError as exc:
-            raise ProcessInspectionError(f"PID {pid} could not be revalidated after analysis: {exc}") from exc
+            raise ProcessInspectionError(f"PID {pid} could not be revalidated after analysis: {exc}",
+                                         kind="exited" if exc.kind == "not_visible" else exc.kind) from exc
         if after != report.process:
-            raise ProcessInspectionError(f"PID {pid} identity, credentials, or context changed during analysis; retry")
+            raise ProcessInspectionError(f"PID {pid} identity, credentials, or context changed during analysis; retry",
+                                         kind="identity_changed")
         report.diagnosis, report.code = diagnosis, diagnosis.code
         if diagnosis.code == ExitCode.ERROR:
             report.indeterminate_reason = diagnosis.trace.error_kind or "diagnostic_error"
     except (ProcessInspectionError, DiagnosticError, OSError, IDMapError) as exc:
+        report.inspection_kind = getattr(exc, "kind", None)
         report.code = ExitCode(exc.code) if hasattr(exc, "code") else ExitCode.ERROR
         report.limitations.append(str(exc))
         if report.code == ExitCode.ERROR:
-            report.indeterminate_reason = getattr(exc, "kind", None) or "process_inspection_failed"
+            report.indeterminate_reason = (exc.kind if isinstance(exc, DiagnosticError) else None) or "process_inspection_failed"
     return report
 
 
@@ -1390,6 +1394,16 @@ def main(argv: list[str] | None = None) -> int:
     process.add_argument("--mode", choices=OPERATIONS, default="r")
     process.add_argument("--json", action="store_true", help="Emit schema 1 JSON, including process metadata")
     process.add_argument("--verbose", action="store_true", help="Show full trace and observed process maps/capabilities")
+    process_audit = commands.add_parser("audit-processes", help="Audit access for visible processes in /proc",
+                                       epilog="Absolute debugger-visible paths only. Sequential snapshots; hidden PIDs are not discovered. "
+                                              "--verbose may expose secrets in command lines. No process fixes.")
+    process_audit.add_argument("target_path")
+    process_audit.add_argument("--pid", action="append", type=pid_argument,
+                               help="Restrict to a PID; repeat for multiple PIDs")
+    process_audit.add_argument("--mode", choices=OPERATIONS, default="r")
+    process_audit.add_argument("--json", action="store_true", help="Include every process individually as schema 1 JSON")
+    process_audit.add_argument("--verbose", action="store_true",
+                               help="Expand all processes, full reasoning and readable command lines (may contain secrets)")
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")
@@ -1412,6 +1426,16 @@ def main(argv: list[str] | None = None) -> int:
         emit_error("unsupported platform; diagnosis requires Linux.", ExitCode.ERROR, "platform")
         return ExitCode.ERROR
     try:
+        if args.command == "audit-processes":
+            import process_audit
+            engine = sys.modules[__name__]
+            report = process_audit.audit_processes(args.target_path, args.mode, pids=args.pid,
+                                                    include_cmdline=args.verbose, engine=engine)
+            if args.json:
+                print(json_output.render_json(process_audit.audit_document(report, __version__)), end="")
+            else:
+                print(process_audit.render_audit(report, verbose=args.verbose, engine=engine))
+            return report.code
         if args.command == "process":
             process_report = diagnose_process(args.target_path, args.pid, args.mode)
             if args.json:

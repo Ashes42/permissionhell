@@ -17,9 +17,10 @@ except ImportError:
 
 
 class ProcessInspectionError(Exception):
-    def __init__(self, message: str, code: int = 3):
+    def __init__(self, message: str, code: int = 3, *, kind: str = "inspection_error"):
         super().__init__(message)
         self.code = code
+        self.kind = kind
 
 
 @dataclass(frozen=True)
@@ -208,9 +209,11 @@ def inspect_process(pid: int) -> ProcessSubject:
     try:
         started = start_time(pid)
     except FileNotFoundError as exc:
-        raise ProcessInspectionError(f"PID {pid} does not exist or is not visible in this procfs", 2) from exc
+        raise ProcessInspectionError(f"PID {pid} does not exist or is not visible in this procfs", 2,
+                                     kind="not_visible") from exc
     except OSError as exc:
-        raise ProcessInspectionError(f"Cannot inspect PID {pid}: {exc}") from exc
+        raise ProcessInspectionError(f"Cannot inspect PID {pid}: {exc}",
+                                     kind="proc_permission" if isinstance(exc, PermissionError) else "inspection_error") from exc
     try:
         status = parse_status(read_text(f"/proc/{pid}/status"))
         mount_ns, user_ns, root = namespace(pid, "mnt"), namespace(pid, "user"), process_root(pid)
@@ -236,8 +239,18 @@ def inspect_process(pid: int) -> ProcessSubject:
         uid_names = {uid: identity_name(uid) for uid in sorted(uids)}
         gid_names = {gid: identity_name(gid, group=True) for gid in sorted(gids)}
         if start_time(pid) != started or parse_status(read_text(f"/proc/{pid}/status")) != status:
-            raise ProcessInspectionError(f"PID {pid} changed identity or credentials during inspection; retry")
+            raise ProcessInspectionError(f"PID {pid} changed identity or credentials during inspection; retry",
+                                         kind="identity_changed")
         return ProcessSubject(pid, started, status, uid_names, gid_names, mount_ns, user_ns, root,
                               maps[0], maps[1], tuple(notes), setgroups, overflow_uid, overflow_gid)
     except OSError as exc:
-        raise ProcessInspectionError(f"PID {pid} disappeared or proc metadata became inaccessible during inspection: {exc}") from exc
+        kind = "proc_permission" if isinstance(exc, PermissionError) else "inspection_error"
+        if isinstance(exc, FileNotFoundError):
+            try:
+                os.stat(f"/proc/{pid}")
+            except FileNotFoundError:
+                kind = "exited"
+            except OSError:
+                pass
+        raise ProcessInspectionError(f"PID {pid} disappeared or proc metadata became inaccessible during inspection: {exc}",
+                                     kind=kind) from exc

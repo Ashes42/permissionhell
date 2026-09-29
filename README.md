@@ -5,7 +5,7 @@ an account passes or fails each directory search check, which Unix permission
 class or POSIX access-ACL entry applies to the target, how an ACL mask changes
 effective permissions, and whether its mount adds a restriction.
 
-**v0.9 models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
+**v1.0 adds visible-process access auditing and models Unix DAC, POSIX access ACLs, mount restrictions, mapped process
 identities across user namespaces, and two effective DAC capabilities in supported
 process contexts, not every Linux access-control layer.** SELinux,
 AppArmor, other capability effects, foreign mount/root path translation,
@@ -46,6 +46,7 @@ python3 permissionhell.py diagnose TARGET_PATH --as USERNAME [--mode {r,w,x}] [-
 python3 permissionhell.py audit TARGET_PATH [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py audit TARGET_PATH --explain USERNAME [--mode {r,w,x}] [--verbose]
 python3 permissionhell.py process ABSOLUTE_TARGET --pid PID [--mode {r,w,x}] [--verbose] [--json]
+python3 permissionhell.py audit-processes ABSOLUTE_TARGET [--pid PID ...] [--mode {r,w,x}] [--verbose] [--json]
 
 python3 permissionhell.py diagnose /srv/music/song.flac --as navidrome --mode r
 python3 permissionhell.py diagnose /var/www/app.db --as www-data --mode w
@@ -82,6 +83,130 @@ An unprivileged debugger may be unable to read necessary metadata. That produces
 a diagnostic error, not a false denial attributed to the subject. Run from an
 account that can inspect the path when necessary; even a privileged invocation
 still evaluates the supplied subject.
+
+## Process/resource access audit (v1.0)
+
+```bash
+permissionhell audit-processes /srv/private/secrets.db --mode r
+permissionhell audit-processes /srv/private/secrets.db --pid 812 --pid 1033
+permissionhell audit-processes /srv/private/secrets.db --json
+permissionhell audit-processes /srv/private/secrets.db --verbose
+```
+
+`audit-processes` enumerates numeric entries directly from `/proc` and runs the
+existing single-process engine independently for each PID. It needs no `ps`,
+container CLI or external utility. It preserves live filesystem IDs, mapped user
+namespace identities, ACL decisions, effective capabilities and mount restrictions.
+There is no new permission algorithm. Account diagnosis, audit and remediation
+behavior stay unchanged. `process TARGET --pid PID` remains the canonical deep dive.
+
+Targets must be absolute paths in the debugger's root and mount namespace. A
+preflight metadata check identifies missing/broken targets before process traversal
+could conceal them. Different mount namespaces or roots remain indeterminate;
+foreign user namespaces use v0.9 mappings and conservative capability scope checks.
+Read-only and noexec mount restrictions still constrain capability-based permits.
+
+The only filter in v1.0 is repeatable `--pid`: selected PIDs are sorted and
+deduplicated, and missing selections are reported instead of silently dropped.
+Without it, all visible numeric proc entries are selected. UID/name filtering is
+deferred to avoid an additional, potentially inconsistent identity snapshot.
+
+Illustrative shortened output (names and PIDs are examples):
+
+```text
+PERMISSION HELL v1.0 | PROCESS AUDIT
+Target: '/srv/private/secrets.db'
+Requested: READ
+
+SUMMARY
+  8 discovered/selected; 7 snapshots inspected
+  1 permitted; 5 denied; 1 indeterminate; 1 unavailable; 0 errors
+
+PERMITTED
+  PID 812 'backupd'
+    Ordinary DAC/ACL would deny. CAP_DAC_READ_SEARCH bypasses the ordinary denial.
+
+INDETERMINATE
+  PID 4412 'container-worker'
+    Different mount namespace; debugger target inode identity unresolved.
+
+UNAVAILABLE
+  PID 9001 None (transient)
+    Process exited during inspection; no permission verdict retained.
+
+DENIED
+  5 processes with the same result
+    PIDs: 101 'bash', 222 'sleep', 310 'python', 400 'worker', 401 'worker'
+    BLOCKED at '/srv/private/secrets.db': OTHER ---; missing READ.
+```
+
+Grouping is presentation-only. Ordinary OTHER results are grouped only when
+their complete decision observations, credentials, mappings, capability context,
+traversal and mounts agree. Equivalent context-inspection failures may also be
+grouped. OWNER, GROUP, ACL, applied capabilities, traversal blockers, mount-only
+denials and other errors remain individual. Groups list up to five PID/name pairs,
+their total and how many more are included. `--verbose` expands every PID and its
+full reasoning. Different identities may produce separate groups even when their
+short reasons look similar; the grouping deliberately favors preserving detail.
+
+The summary's `discovered` count means unique visible or explicitly selected PIDs;
+every one has exactly one result. `inspected` counts retained complete process
+snapshots, including snapshots with an indeterminate access result. Exited/reused
+snapshots are discarded and do not count as inspected. Category counts always
+sum to discovered; inspected is a separate observation count.
+
+| Result | Meaning |
+| --- | --- |
+| PERMITTED | Existing process model permits access |
+| DENIED | A modeled access check blocks access |
+| INDETERMINATE | Namespace, mapping or capability scope prevents a reliable verdict |
+| ERROR | Required procfs context could not be inspected, metadata is malformed, or another diagnostic/system check failed |
+| UNAVAILABLE | Process disappeared, changed identity/context during observation, or is absent/not visible |
+
+| Exit code | Process-audit meaning |
+| --- | --- |
+| 0 | All results definitive or explicitly transient; ordinary denials are data |
+| 2 | Invalid request or unresolved target, including a target lost mid-audit |
+| 3 | Enumeration failed/was empty, or any error, indeterminate result or unconfirmed unavailable PID remains |
+
+A PID that was observed and then confirmed absent, or whose identity/credentials
+changed during evaluation, is transient and does not by itself force exit 3.
+Absence at the first inspection may instead be `hidepid`; that is reported as
+unavailable with exit 3, even for an explicit PID. No missing PID is guessed to
+be a definite access denial. Partial results survive other processes' failures.
+
+JSON remains schema **1**. The `command: "audit-processes"` document contains
+`summary`, `processes`, overall `verdict`, `exit_code`, and audit-level `errors`.
+Every entry retains the existing process document's `subject`, `process`
+(credentials, namespaces, mappings and capabilities), `access_path`, `target_inode`,
+`mount`, `reasons`, and inspection details where available. Entry `verdict` uses
+the audit categories above, with `name`, `transient` and `reason_code` added. No human grouping
+is applied to JSON. Discarded/unavailable snapshots have null process/subject
+data rather than an invented identity or permission verdict. Aggregate exit codes
+are authoritative; an embedded single-process exit code retains its original meaning.
+
+**Visibility and races:** only processes visible in the current procfs view can
+be discovered. Hidepid, Yama, user/mount namespaces and other kernel policies can
+prevent inspection. The tool does not claim to enumerate every process on the
+physical host. Existing process start-time and credential revalidation reduce PID
+reuse mistakes, but discovery and evaluation are sequential, not atomic. New
+processes after discovery are absent, processes can exit, and files/ACLs/mounts or
+credentials can change between observations. No identity cache is shared across PIDs.
+
+**Privacy:** default output/JSON uses the proc status process name (possibly
+truncated), never full arguments. Only `--verbose` reads readable `cmdline` data;
+`--verbose --json` includes it too. Arguments can contain passwords/tokens, so
+review verbose reports before sharing. Command-line reads are checked against
+the observed start time and discarded if PID identity changes. An unreadable
+optional command line does not invalidate an otherwise completed access check.
+Reports also expose PIDs, names, IDs/groups, namespace relationships, maps,
+capability sets and target paths. No environment variables or process memory are read.
+
+Permission Hell never signals, pauses, attaches to or modifies processes. Runtime
+audits do not create namespaces, write mappings, change capabilities or security
+settings, remount filesystems, or modify target files. No process remediation is
+offered. The existing limits on LSM policies, idmapped mounts, filesystem-specific
+authorization and actual syscall success still apply.
 
 ## Running-process analysis (v0.7)
 
@@ -142,7 +267,7 @@ the numeric task visible at `/proc/PID` is inspected, not every thread in a grou
 Illustrative normal-process excerpt:
 
 ```text
-PERMISSION HELL v0.9 | PROCESS DIAGNOSE
+PERMISSION HELL v1.0 | PROCESS DIAGNOSE
 PID: 1842
 Process: 'nginx'
 Target: '/srv/site/index.html'
@@ -413,7 +538,7 @@ component therefore does not replace a known earlier traversal denial.
 Illustrative permitted result (ordinary metadata shortened here):
 
 ```text
-PERMISSION HELL v0.9 | AUDIT EXPLAIN
+PERMISSION HELL v1.0 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: member (UID 2000)
 Requested: READ
@@ -438,7 +563,7 @@ WHY
 Illustrative denial excerpt:
 
 ```text
-PERMISSION HELL v0.9 | AUDIT EXPLAIN
+PERMISSION HELL v1.0 | AUDIT EXPLAIN
 Target: '/data/file'
 Subject: visitor (UID 2001)
 Requested: READ
@@ -729,7 +854,7 @@ tested: a service account can access files without interactive login.
 Illustrative output for a three-account inventory:
 
 ```text
-PERMISSION HELL v0.9 | ACCESS AUDIT
+PERMISSION HELL v1.0 | ACCESS AUDIT
 Target: '/srv/customer-data/report.csv'
 Requested: READ (r)
 Local accounts: /etc/passwd (including service accounts)
@@ -827,7 +952,7 @@ Illustrative output for a subject whose group permits traversal but whose
 target access falls into OTHER:
 
 ```text
-PERMISSION HELL v0.9 | READ as navidrome (UID 1001)
+PERMISSION HELL v1.0 | READ as navidrome (UID 1001)
 Target: '/srv/music/song.flac'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -907,7 +1032,7 @@ For example, with `user:33:rw-` and `mask::r--`, UID 33 can read but cannot writ
 An illustrative concise denial (assuming the parent directories permit search):
 
 ```text
-PERMISSION HELL v0.9 | WRITE as www-data (UID 33)
+PERMISSION HELL v1.0 | WRITE as www-data (UID 33)
 Target: '/srv/data/file.txt'
 
 ACCESS DENIED (DAC + ACL + mount model)
@@ -1078,6 +1203,7 @@ decoder and pure ACL evaluator; `permissionhell.py` integrates their results:
 | CLI | `main()` |
 | Identity | `resolve_subject()` / `Subject` |
 | Namespace identity mapping | `IDMap`, `IDTranslation`, `NamespaceIdentity` in `idmap.py` |
+| Process inventory and access audit | `audit_processes()` / `ProcessAuditResult`, `ProcessAuditEntry`, `ProcessAuditSummary` in `process_audit.py` |
 | Permission engine | `evaluate_permission()` / `PermissionDecision` |
 | ACL inspection and selection | `read_access_acl()`, `evaluate_acl()` / `AccessACL`, `ACLMatch` |
 | Path resolution and traversal | `trace_path()` / `PathTrace`, `Inode`, `Symlink` |
@@ -1120,6 +1246,7 @@ real local accounts against temporary files/symlinks, without requiring root.
 
 - Formal JSON Schema validation and streaming large audit results.
 - Audit account filtering.
+- Process-audit UID/name filtering with explicit snapshot semantics.
 - Default-ACL inheritance and richer ACL inspection output.
 - SELinux and AppArmor context and policy diagnostics.
 - Establishing capability scope in foreign user namespaces.
