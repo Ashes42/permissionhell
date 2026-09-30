@@ -21,7 +21,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 
 def display_version() -> str:
@@ -1389,7 +1389,9 @@ def render_remediations(suggestions: list[RemediationSuggestion]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__, epilog=SCOPE_TEXT)
+    parser = argparse.ArgumentParser(prog="permissionhell", description=__doc__,
+        epilog="Use permissionhell COMMAND --help for examples. Read-only analysis; snapshot/monitor outputs require explicit paths. "
+               "Results describe a model, not a guarantee of kernel authorization.")
     parser.add_argument("--version", action="version", version=f"permissionhell {__version__}")
     commands = parser.add_subparsers(dest="command", required=True)
     command = commands.add_parser("diagnose", help="Explain Linux DAC, ACL, and mount access decisions", epilog=SCOPE_TEXT)
@@ -1409,7 +1411,7 @@ def main(argv: list[str] | None = None) -> int:
     audit.add_argument("--verbose", action="store_true",
                        help="Show every account without grouping; with --explain, add full diagnostic detail")
     process = commands.add_parser("process", help="Evaluate a running PID's filesystem credentials",
-                                  epilog="Absolute debugger-visible paths only; foreign roots/namespaces are indeterminate. No process fixes.")
+                                  epilog="Absolute debugger-visible paths only; foreign roots/mount namespaces are indeterminate. No process fixes.")
     process.add_argument("target_path")
     def pid_argument(value: str) -> int:
         if not re.fullmatch(r"[0-9]{1,10}", value) or not 0 < int(value) <= 0x7FFFFFFF:
@@ -1473,6 +1475,24 @@ def main(argv: list[str] | None = None) -> int:
             monitor.add_argument("--update-baseline", action="store_true")
             monitor.add_argument("--verbose", action="store_true")
             monitor.add_argument("--ignore-process-churn", action="store_true", help="Hide additions/removals in text only; exit code and JSON unchanged")
+    examples = {
+        "diagnose": "diagnose /srv/data.db --as www-data --mode r",
+        "audit": "audit /srv/data.db --explain www-data",
+        "process": "process /srv/data.db --pid 812",
+        "audit-processes": "audit-processes /srv/data.db --json",
+        "graph": "graph /srv/data.db --as www-data --dot",
+        "policy-check": "policy-check policy.json --json",
+        "snapshot": "snapshot /srv/data.db --output before.json",
+        "diff": "diff before.json after.json --json",
+        "monitor-init": "monitor-init /srv/data.db --baseline baseline.json",
+        "monitor-check": "monitor-check /srv/data.db --baseline baseline.json --update-baseline",
+    }
+    for name, subparser in commands.choices.items():
+        if name in ("diagnose", "audit"):
+            subparser.epilog = "Account model: Unix DAC, POSIX ACLs and mount restrictions; no live process context. Use --verbose for detailed scope."
+            if name == "audit":
+                subparser.epilog = "Includes service accounts; modeled access, not intended policy. " + subparser.epilog
+        subparser.epilog = (subparser.epilog or "") + " Example: permissionhell " + examples[name]
     args = parser.parse_args(argv)
     if args.command == "audit" and args.suggest_fixes and args.explain is None:
         parser.error("--suggest-fixes requires --explain USER")

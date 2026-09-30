@@ -1,19 +1,39 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "permissionhell"
 dynamic = ["version"]
-description = "Read-only Linux access diagnosis and local-account audits with Unix DAC, POSIX ACLs, and mount restrictions"
+description = "Explain modeled Linux file access, audit accounts and processes, and monitor access changes"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["linux", "permissions", "acl", "diagnostics", "security"]
+classifiers = [
+    "Environment :: Console",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Systems Administration",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "build>=1.2,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 
 [project.scripts]
 permissionhell = "permissionhell:main"
 
 [tool.setuptools]
+include-package-data = false
 py-modules = ["permissionhell", "posix_acl", "json_output", "process_subject", "capabilities", "idmap", "process_audit", "access_graph", "policy_drift", "access_snapshot", "lsm", "access_monitor"]
 
 [tool.setuptools.dynamic]
