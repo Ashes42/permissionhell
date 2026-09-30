@@ -127,8 +127,10 @@ def _subject(observation: dict, scope: str) -> SnapshotSubject:
         identity = {"pid": observation["pid"], "start_time_ticks": process.get("start_time_ticks")}
         name = observation["name"]
     routes = _authorization(observation)
-    blocker = observation.get("first_blocker")
+    blocker = observation.get("effective_blocker") or observation.get("first_blocker")
     mechanism = "mount" if blocker and blocker["stage"] == "mount" else routes[-1]["mechanism"] if routes else None
+    if blocker and blocker.get("stage") == "lsm":
+        mechanism = blocker["mechanism"]
     if observation["verdict"] == "permitted" and any(route["capability"] for route in routes):
         mechanism = "capability"
     return SnapshotSubject(identity, name, observation["verdict"], mechanism, blocker, routes, observation)

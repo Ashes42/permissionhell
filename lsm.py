@@ -1,4 +1,4 @@
-"""Read-only LSM observations and conservative decisions; no policy interpreter.
+"""Read-only LSM observations and optional host policy decisions; no policy interpreter.
 
 None means unknown, never disabled. Proc attributes are read per LSM first;
 the legacy shared attribute is used only when its owner is unambiguous.
@@ -43,6 +43,7 @@ class LSMState:
 class LSMDecision:
     status: str
     reasons: tuple[str, ...]
+    layer_results: tuple[dict, ...] = ()
 
 
 def parse_active(text: str) -> tuple[str, ...]:
@@ -203,13 +204,14 @@ def inspect_target(state: LSMState, path: str) -> LSMState:
     return replace(state, selinux=se)
 
 
-def evaluate(state: LSMState, ordinary_code: int) -> LSMDecision:
+def evaluate(state: LSMState, ordinary_code: int, *, layer_results=()) -> LSMDecision:
     if ordinary_code != 0:
         return LSMDecision("not_required", ("Ordinary permissions already deny access." if ordinary_code == 1
                            else "Ordinary permission analysis did not establish a permit.",))
     if state.malformed:
         return LSMDecision("error", state.malformed)
     reasons, notes = [], []
+    layers = {layer["module"]: layer for layer in layer_results}
     aa, se = state.apparmor, state.selinux
     if aa.enabled is False:
         notes.append("AppArmor inactive.")
@@ -217,7 +219,8 @@ def evaluate(state: LSMState, ordinary_code: int) -> LSMDecision:
         notes.append("AppArmor unconfined: no additional restriction modeled." if aa.mode == "unconfined"
                      else "AppArmor complain mode: informational, non-enforcing in this model.")
     else:
-        reasons.append("AppArmor profile is active but policy rules are not evaluated." if aa.enabled and aa.profile
+        reasons.append(layers["apparmor"]["reason"] if "apparmor" in layers else
+                       "AppArmor profile is active but policy rules are not evaluated." if aa.enabled and aa.profile
                        else "AppArmor state/profile unavailable; final authorization cannot be established.")
     if se.enabled is False:
         notes.append("SELinux inactive.")
@@ -225,8 +228,11 @@ def evaluate(state: LSMState, ordinary_code: int) -> LSMDecision:
         notes.append("SELinux initial kernel context: policy not loaded; no policy restriction modeled.")
     elif se.enabled and se.enforcing is False:
         notes.append("SELinux permissive: would log policy denials without enforcing them.")
+    elif se.enforcing and "selinux" in layers and layers["selinux"]["decision"] in ("allowed", "denied"):
+        notes.append(layers["selinux"]["reason"])
     else:
-        reasons.append("SELinux enforcing: policy decision is not evaluated." if se.enforcing
+        reasons.append(layers["selinux"]["reason"] if "selinux" in layers else
+                       "SELinux enforcing: policy decision is not evaluated." if se.enforcing
                        else "SELinux activity/enforcement unavailable; final authorization cannot be established.")
     # These can mediate file access. Landlock availability alone does not prove
     # this task installed a ruleset; its per-task restrictions are not observable.
@@ -235,7 +241,23 @@ def evaluate(state: LSMState, ordinary_code: int) -> LSMDecision:
         reasons.append("Active file-policy LSMs not evaluated: " + ", ".join(sorted(relevant)) + ".")
     if "landlock" in state.active:
         notes.append("Landlock available; per-task rulesets are not detected or modeled.")
-    return LSMDecision("indeterminate" if reasons else "resolved", tuple(reasons + notes))
+    denied = any(layer["decision"] == "denied" for layer in layer_results)
+    return LSMDecision("denied" if denied else "indeterminate" if reasons else "resolved",
+                       tuple(reasons + notes), tuple(layer_results))
+
+
+def resolve(state, ordinary_code, process, diagnosis):
+    """Augment awareness through optional adapters, inside process revalidation."""
+    if ordinary_code != 0 or state.malformed:
+        return evaluate(state, ordinary_code)
+    import lsm_policy
+    layers = []
+    se, aa = state.selinux, state.apparmor
+    if se.enabled and se.enforcing and se.policy_loaded is not False:
+        layers.append(lsm_policy.query_selinux(state, diagnosis))
+    if aa.enabled and aa.mode not in ("unconfined", "complain"):
+        layers.append(lsm_policy.correlate_apparmor(state, process, diagnosis))
+    return evaluate(state, ordinary_code, layer_results=layers)
 
 
 def document(state: LSMState) -> dict:
@@ -246,7 +268,8 @@ def document(state: LSMState) -> dict:
 
 
 def decision_document(decision: LSMDecision) -> dict:
-    return {"status": decision.status, "reason": " ".join(decision.reasons), "reasons": list(decision.reasons)}
+    return {"status": decision.status, "reason": " ".join(decision.reasons), "reasons": list(decision.reasons),
+            "layer_results": list(decision.layer_results)}
 
 
 def summary_lines(state: LSMState) -> list[str]:

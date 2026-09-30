@@ -1,6 +1,6 @@
 # Structured formats
 
-Release version and format version are independent. v1.6 changes no format version.
+Release version and format version are independent. v1.7 changes no format version.
 This document describes the existing contracts; it is not a formal JSON Schema.
 
 | Format | Version field | Current value | Owner |
@@ -55,3 +55,19 @@ for exact policy shapes; policy version 1 is not inferred from missing metadata.
 
 The changelog must identify schema changes separately from tool-version changes.
 No consolidated formal JSON Schema or automatic migration tool is provided yet.
+
+## v1.7 additive LSM evidence
+
+All format versions remain unchanged. `lsm_result.layer_results` contains module
+results with `module`, `decision` (`allowed`, `denied`, `unresolved`), `reason` and
+`evidence`. SELinux evidence includes contexts, path, class, requested permissions,
+access vectors, policy sequence and adapter/source. AppArmor evidence identifies
+historical events and correlation limits. `lsm_result.status` additionally supports
+`denied`; `resolved` retains its existing meaning. Consumers must treat unfamiliar
+statuses conservatively.
+
+LSM denial adds `effective_blocker` (stage, mechanism, path, reason).
+`ordinary_verdict` and `first_blocker` retain ordinary filesystem meanings.
+Graphs and snapshots retain the evidence; snapshot mechanisms use the effective
+blocker. Old snapshots remain readable. Recent-log evidence changes can appear as
+context drift in diff/monitor, without proving a current authorization change.

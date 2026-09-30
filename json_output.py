@@ -268,7 +268,7 @@ def process_document(report: ProcessDiagnosis, version: str) -> dict:
                    "path_context": "debugger_absolute_path_root_and_mount_namespace",
                    "limitations": list(report.limitations),
                    "indeterminate_reason": report.indeterminate_reason,
-                   "model_limitations": ["Only effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH affect r/w/x; LSM policies remain unmodeled.",
+                   "model_limitations": ["Only effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH affect r/w/x; LSM coverage is partial; see LSM decision evidence.",
                                          "Live UID 0 has no implicit bypass. Non-identity or unknown namespace maps cannot authorize capability bypasses.",
                                          "Foreign user IDs are validated in the debugger's namespace; foreign capability scope is not established.",
                                          "Foreign mount namespaces and roots are not entered or translated.",
@@ -281,6 +281,12 @@ def process_document(report: ProcessDiagnosis, version: str) -> dict:
     result["ordinary_verdict"] = VERDICTS[report.diagnosis.code] if report.diagnosis else None
     if report.lsm_result:
         result["reasons"].extend(report.lsm_result.reasons)
+        if report.lsm_result.status == "denied":
+            denied = next((layer for layer in report.lsm_result.layer_results if layer["decision"] == "denied"), None)
+            blocked = next((item for item in denied["evidence"] if item.get("allowed") is False), None) if denied else None
+            result["effective_blocker"] = {"stage": "lsm", "mechanism": denied["module"] if denied else "lsm",
+                                           "path": blocked["path"] if blocked else report.requested_path,
+                                           "reason": denied["reason"] if denied else "LSM denial"}
         if report.lsm_result.status == "error":
             result["verdict"] = "error"
             result["errors"].extend(error_data(reason, report.code, "lsm") for reason in report.lsm_result.reasons)

@@ -21,7 +21,7 @@ from process_subject import ProcessSubject, ProcessInspectionError, inspect_proc
 from capabilities import CapabilitySet, CapabilityDecision, CapabilityError, evaluate_capabilities
 from idmap import NamespaceIdentity, IDMapError, namespace_identity
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 
 def display_version() -> str:
@@ -616,6 +616,7 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
         diagnosis = diagnose(path, process_filesystem_subject(report.process), mode)
         if report.lsm is not None and diagnosis.trace.target is not None:
             report.lsm = lsm.inspect_target(report.lsm, diagnosis.trace.target.path)
+        security_decision = lsm.resolve(report.lsm, diagnosis.code, report.process, diagnosis) if report.lsm is not None else None
         # Recheck identity, credentials, root and namespaces after the path walk.
         # A changed/exited/reused PID must not inherit the earlier observation's verdict.
         try:
@@ -628,7 +629,9 @@ def diagnose_process(path: str, pid: int, mode: str = "r") -> ProcessDiagnosis:
                                          kind="identity_changed")
         report.diagnosis, report.code = diagnosis, diagnosis.code
         if report.lsm is not None:
-            report.lsm_result = lsm.evaluate(report.lsm, diagnosis.code)
+            report.lsm_result = security_decision
+            if report.lsm_result.status == "denied":
+                report.code = ExitCode.DENIED
             if report.lsm_result.status in ("indeterminate", "error"):
                 report.code = ExitCode.ERROR
                 report.indeterminate_reason = ("lsm_policy_unresolved" if report.lsm_result.status == "indeterminate"
@@ -1239,7 +1242,7 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
     lines.extend(["", f"RESULT: {result}"])
     if report.diagnosis:
         process_scope = ("Scope: live process fsuid/fsgid/groups, effective CAP_DAC_OVERRIDE and CAP_DAC_READ_SEARCH; "
-                         "no UID-0 shortcut. Foreign capability scope, mount/root translation and LSM policies remain unmodeled.")
+                         "no UID-0 shortcut. Foreign capability scope, mount/root translation and LSM coverage is partial; see LSM decision evidence.")
         lines.extend(["", "ACCESS PATH", *explanation_detail_lines(report.diagnosis, verbose, scope_text=process_scope)])
     else:
         lines.extend(["", "WHY", *report.limitations])
@@ -1248,8 +1251,16 @@ def render_process_report(report: ProcessDiagnosis, verbose: bool = False) -> st
                       "  Ordinary DAC/ACL, capability and mount result: " +
                       ("PERMITTED" if report.diagnosis and report.diagnosis.code == 0 else "not permitted"),
                       *("  " + reason for reason in report.lsm_result.reasons)])
+        for layer in report.lsm_result.layer_results:
+            lines.append(f"  {layer['module']}: {layer['decision']}")
+            for evidence in layer["evidence"] if verbose else layer["evidence"][:3]:
+                if evidence["kind"] == "kernel_policy_query":
+                    lines.append(f"    {evidence['source']}: {evidence['path']!r} {evidence['object_class']} "
+                                 f"{','.join(evidence['permissions'])} -> {'ALLOW' if evidence['allowed'] else 'DENY'}")
+                else:
+                    lines.append(f"    Historical DENIED evidence from {evidence['source']}: {evidence['path']!r}; not current authorization proof")
     lines.extend(["", "Model: proc filesystem IDs/groups + DAC/ACL + effective DAC capabilities + mount restrictions.",
-                  "LSM policies, other capability effects, foreign capability scope and mount/root translation remain unmodeled.",
+                  "LSM coverage is partial; other capability effects, foreign capability scope and mount/root translation remain unmodeled.",
                   "Process snapshots are not atomic. Process remediation commands are not supported."])
     return "\n".join(lines)
 

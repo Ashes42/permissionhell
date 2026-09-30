@@ -64,3 +64,21 @@ history. Protect exports and avoid attaching unsanitized reports to public issue
 There is no telemetry, remote reporting, scheduler or background daemon.
 
 See [SECURITY.md](../SECURITY.md) for reporting suspected vulnerabilities.
+
+## Optional LSM evidence trust
+
+Host SELinux bindings/libraries and kernel policy establish only queried vectors
+for observed labels, not full syscall authorization. Inode, label, policy sequence
+and process rechecks reduce races but are not atomic. Inconsistent/unavailable
+queries never create permission. The selinuxfs query exchange does not mutate
+policy. Execution transitions and incomplete operation coverage remain unresolved.
+
+AppArmor logs may be stale, incomplete, rotated, forged, or refer to another PID
+namespace/generation or inode. Even exact recent matches remain historical
+evidence, not authoritative current authorization. Missing records never permit
+access. File reads are bounded and refuse symlinks/nonregular files; journal calls
+have fixed arguments and a timeout. Journal output is captured before its size
+check, so memory use is not absolutely bounded. No root requirement, installation
+or network lookup is introduced. Exports can disclose profile names, paths and
+audit event IDs. Live enforcing SELinux/AppArmor decisions are tested with mocks;
+WSL does not provide a real enforcing-policy integration environment.

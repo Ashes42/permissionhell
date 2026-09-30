@@ -12,7 +12,7 @@ CLI / permissionhell.main
   -> exclusive Unix DAC / POSIX access ACL
   -> effective DAC capability override (processes)
   -> mount restrictions
-  -> LSM awareness (processes)
+  -> LSM observation and optional policy decision (processes)
   -> final modeled verdict
 ```
 
@@ -24,6 +24,7 @@ CLI / permissionhell.main
 | idmap | Pure ID-map validation and debugger/local identity interpretation |
 | capabilities | Effective capability sets and supported DAC overrides |
 | lsm | Kernel-interface detection, AppArmor/SELinux context and conservative policy confidence |
+| lsm_policy | Optional libselinux queries and bounded AppArmor denial-log correlation |
 | json_output | Structured command projections; no authorization decisions |
 | process_audit | Visible-PID inventory, per-PID classification, summaries and text/JSON |
 | access_graph | Collected diagnoses to nodes/edges, text, JSON and DOT |
@@ -46,3 +47,9 @@ model; rendering does not grant fallback permission.
 `permissionhell.__version__` is the canonical release version. Setuptools reads its
 literal value through dynamic metadata; console and script entry points both call
 `main`. Export versions are separate contracts: see [schemas](schemas.md).
+
+`lsm.resolve` runs after ordinary permission checks and before final process
+revalidation. SELinux vectors, labels and inode identities are rechecked; evidence
+is returned independently of rendering. A policy denial can refine an ordinary
+permit to DENIED. AppArmor correlations remain historical evidence. Downstream
+consumers reuse this single decision path.

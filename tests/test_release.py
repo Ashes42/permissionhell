@@ -45,7 +45,7 @@ class CliReleaseTests(unittest.TestCase):
 
     def test_version_is_canonical(self):
         self.assertEqual(self.output(["--version"]).strip(), f"permissionhell {ph.__version__}")
-        self.assertEqual(ph.__version__, "1.6.0")
+        self.assertEqual(ph.__version__, "1.7.0")
 
     def test_unknown_command(self):
         self.output(["not-a-command"], 2)

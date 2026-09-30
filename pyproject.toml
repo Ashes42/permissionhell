@@ -34,7 +34,7 @@ permissionhell = "permissionhell:main"
 
 [tool.setuptools]
 include-package-data = false
-py-modules = ["permissionhell", "posix_acl", "json_output", "process_subject", "capabilities", "idmap", "process_audit", "access_graph", "policy_drift", "access_snapshot", "lsm", "access_monitor"]
+py-modules = ["permissionhell", "posix_acl", "json_output", "process_subject", "capabilities", "idmap", "process_audit", "access_graph", "policy_drift", "access_snapshot", "lsm", "lsm_policy", "access_monitor"]
 
 [tool.setuptools.dynamic]
 version = {attr = "permissionhell.__version__"}

@@ -2,6 +2,11 @@
 
 Milestone history; historical release dates have not been reconstructed.
 
+- **1.7.0 — LSM decision support:** optional host libselinux access-vector queries,
+  domain-permissive handling, bounded AppArmor log correlation and structured
+  evidence in process reports, audits, graphs, policy and snapshots. Ordinary
+  results remain separate; format versions unchanged.
+
 - **1.6.0 — Release hardening:** explicit packaging metadata and dev tools, CLI
   examples, Ubuntu CI, isolated wheel/build checks, schema/architecture/security
   documentation and a concise installation-first README. Format versions unchanged.

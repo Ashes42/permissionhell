@@ -38,9 +38,7 @@ Direct source execution remains supported: `python3 permissionhell.py --help`.
 There is no runtime need for Rich, Graphviz, getfacl, aa-status or sestatus.
 Build tooling may need network access during installation.
 
-**Release gap:** this checkout has no LICENSE file. No license grant or SPDX
-identifier has been invented. The owner must decide licensing before distribution
-as an openly licensed project. These instructions describe local installation.
+Licensed under the [MIT License](LICENSE).
 
 ## Quick start
 
@@ -93,11 +91,13 @@ Proc credentials are debugger-visible IDs. Namespace maps validate translations;
 foreign mount/root paths and uncertain capability scope remain conservative.
 PID identity and credentials are rechecked, but observations are not atomic.
 
-### LSM awareness
+### LSM decision support
 
-AppArmor profiles/modes and SELinux contexts/enforcement are observed without full
-policy simulation. Confined/enforcing policy can turn an ordinary permit into
-INDETERMINATE; a clear ordinary denial stays DENIED. Account-only checks have no
+SELinux decisions use optional host Python bindings or libselinux through ctypes.
+Covered policy vectors can resolve allow or deny; unavailable tooling or incomplete
+coverage remains INDETERMINATE. Nothing is installed automatically. AppArmor log
+matches provide historical evidence; confined access remains INDETERMINATE without
+proof of current authorization. A clear ordinary denial stays DENIED. Account-only checks have no
 live process security context. See the [detailed reference](docs/reference.md) for
 complain/permissive behavior, stacking and unsupported-LSM limitations.
 

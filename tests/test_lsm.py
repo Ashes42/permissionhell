@@ -13,6 +13,7 @@ import access_graph as graph
 import access_snapshot as snap
 import json_output as jo
 import lsm
+import lsm_policy
 import permissionhell as ph
 import process_audit as pa
 import process_subject as ps
@@ -37,7 +38,10 @@ def state(profile=None, enforcing=None, *, active=None):
 
 def report(security=None, *, permissions=4, **kwargs):
     observed = replace(process_with(kwargs.pop("mask", 0)), lsm=security or state())
-    with patch.object(lsm.os, "getxattr", return_value=b"system_u:object_r:data_t:s0\0"):
+    with patch.object(lsm.os, "getxattr", return_value=b"system_u:object_r:data_t:s0\0"), \
+            patch.object(lsm_policy, "load_selinux", side_effect=ImportError("No fixture policy backend")), \
+            patch.object(lsm_policy, "read_log_tail", side_effect=PermissionError("Fixture logs unavailable")), \
+            patch.object(lsm_policy, "read_journal", side_effect=PermissionError("Fixture journal unavailable")):
         return evaluate(process=observed, permissions=permissions, **kwargs)
 
 

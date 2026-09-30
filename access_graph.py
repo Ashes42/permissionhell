@@ -158,10 +158,16 @@ def build_graph(data: dict) -> AccessGraph:
         security = data["lsm"]
         decision = data.get("lsm_result") or {"status": "not_evaluated", "reason": "LSM decision not evaluated."}
         aa, se = security["apparmor"], security["selinux"]
+        selinux_state = (
+            "inactive" if se["enabled"] is False
+            else "enforcing" if se["enforcing"] is True
+            else "permissive" if se["enforcing"] is False
+            else "state unknown"
+        )
         label = (f"AppArmor {aa['profile']!r} ({aa['mode'] or 'unknown'}); SELinux " +
-                 {True: "enforcing", False: "permissive", None: "unknown/inactive"}[se['enforcing']] +
-                 ": " + decision["reason"])
+                 selinux_state + ": " + decision["reason"])
         graph.append(GraphNode("lsm:policy", "lsm", label,
+                               "fail" if decision["status"] == "denied" else "pass" if decision["status"] == "resolved" else
                                decision["status"] if decision["status"] in ("indeterminate", "error") else "neutral",
                                {"lsm": security, "lsm_result": decision}), "constrained_by")
     if data.get("errors") or data.get("limitations"):
